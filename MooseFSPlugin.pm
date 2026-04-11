@@ -1021,7 +1021,7 @@ sub volume_resize {
         Carp::confess("[${\__PACKAGE__}::$0] called with invalid volname: " . (defined $volname ? ref($volname) : 'undef'));
     }
 
-    log_debug "[volume_resize] Resizing $volname to $size KiB";
+    log_debug "[volume_resize] Resizing $volname to $size bytes";
 
     # Defensive - make sure $scfg is a hashref, not a storeid
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
@@ -1041,7 +1041,8 @@ sub volume_resize {
 
     log_debug "[volume_resize] Resizing mfsbdev volume: $mfs_path";
 
-    my $size_bytes = $size * 1024;  # Convert KiB to bytes
+    # PVE passes $size in bytes to volume_resize (not KiB).
+    my $size_bytes = $size;
 
     # Step 1: Check if volume is currently mapped and unmap it
     my $was_mapped = 0;
