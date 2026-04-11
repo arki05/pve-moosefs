@@ -30,6 +30,9 @@ install:
 	# Install the patch file
 	install -d ${DESTDIR}${DATADIR}
 	install -m 0644 pve-moosefs.patch ${DESTDIR}${DATADIR}/
+	# Install pvestatd systemd drop-in (see issue #60)
+	install -d ${DESTDIR}/etc/systemd/system/pvestatd.service.d
+	install -m 0644 systemd/pvestatd-moosefs.conf ${DESTDIR}/etc/systemd/system/pvestatd.service.d/moosefs.conf
 
 .PHONY: deb ${DEB}
 deb ${DEB}:
