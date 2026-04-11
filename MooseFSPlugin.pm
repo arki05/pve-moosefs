@@ -1104,6 +1104,10 @@ sub volume_resize {
 
 # Return the first pid holding an open fd to $nbd_device, or 0 if none.
 # Used to refuse destructive unmaps while a VM is actively using the device.
+# The mfsbdev daemon is the NBD *server* for the device and always holds an
+# fd to it, so it would be a false positive — it must be excluded, otherwise
+# no snapshot of any mapped volume could ever proceed (even the 'mixed' flow
+# that unmaps explicitly via with_nbd_unmapped).
 sub nbd_device_holder_pid {
     my ($nbd_device) = @_;
 
@@ -1114,6 +1118,18 @@ sub nbd_device_holder_pid {
     for my $pid (@pids) {
         $pid =~ /^(\d+)$/ or next;
         $pid = $1;
+
+        # Skip the mfsbdev daemon (and its worker threads) — it's the server
+        # side of the NBD device, not a consumer. Only non-server holders
+        # like qemu/kvm should block the snapshot flow.
+        my $comm;
+        if (open(my $cf, '<', "/proc/$pid/comm")) {
+            $comm = <$cf>;
+            close $cf;
+            chomp $comm if defined $comm;
+        }
+        next if defined $comm && $comm eq 'mfsbdev';
+
         my $fd_dir = "/proc/$pid/fd";
         opendir(my $fdh, $fd_dir) or next;
         while (my $fd = readdir($fdh)) {
