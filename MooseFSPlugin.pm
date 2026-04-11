@@ -575,7 +575,7 @@ sub free_image {
 }
 
 sub map_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname) = @_;
+    my ($class, $storeid, $scfg, $volname, $snapname, $hints) = @_;
 
     # Ensure $scfg is a hashref if it was passed as a storeid (though less likely for this internal func)
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
@@ -734,7 +734,7 @@ sub map_volume {
 }
 
 sub activate_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
 
     # Defensive - make sure $scfg is a hashref, not a storeid
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
@@ -742,9 +742,10 @@ sub activate_volume {
     log_debug "[activate-volume] Activating volume $volname";
     die "Expected hashref for \$scfg in activate_volume, got: $scfg" unless ref($scfg) eq 'HASH';
 
-    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname) if !$scfg->{mfsbdev};
+    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname, $cache, $hints)
+        if !$scfg->{mfsbdev};
 
-    $class->map_volume($storeid, $scfg, $volname, $snapname) if $scfg->{mfsbdev};
+    $class->map_volume($storeid, $scfg, $volname, $snapname, $hints) if $scfg->{mfsbdev};
 
     return 1;
 }
