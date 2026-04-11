@@ -1324,6 +1324,78 @@ sub volume_snapshot_rollback {
     });
 }
 
+# Declare how running-VM snapshots should be handled. For raw mfsbdev volumes
+# we use 'mixed' mode: qemu closes the volume, we perform an offline MooseFS
+# snapshot (unmap, mfsmakesnapshot, remap), then qemu reopens it. This is what
+# allows snapshot operations on running VMs without the NBD-crash of issue #58.
+# Non-mfsbdev volumes fall through to the base class, which returns 'qemu' for
+# qcow2 and 'storage' for raw on plain file storage.
+sub volume_qemu_snapshot_method {
+    my ($class, $storeid, $scfg, $volname) = @_;
+
+    if ($scfg->{mfsbdev}) {
+        my ($vtype, undef, undef, undef, undef, undef, $format) =
+            eval { $class->parse_volname($volname) };
+        if (!$@ && $vtype eq 'images' && $format eq 'raw') {
+            return 'mixed';
+        }
+    }
+
+    return $class->SUPER::volume_qemu_snapshot_method($storeid, $scfg, $volname);
+}
+
+# Rename a snapshot directory. The special source name "current" means "the
+# live volume" — swap the live file into the named snapshot slot. Likewise a
+# target of "current" means promote a snapshot back into the live slot. This
+# is required by PVE's 'mixed' snapshot flow for merging/unhooking snapshots
+# on running VMs.
+sub rename_snapshot {
+    my ($class, $scfg, $storeid, $volname, $source_snap, $target_snap) = @_;
+
+    my ($vtype, $name, $vmid, undef, undef, undef, $format) =
+        $class->parse_volname($volname);
+
+    if ($vtype ne 'images' || $format ne 'raw') {
+        return $class->SUPER::rename_snapshot($scfg, $storeid, $volname, $source_snap, $target_snap);
+    }
+
+    my $mountpoint = $scfg->{path};
+    my $live_file  = "$mountpoint/images/$vmid/$name";
+
+    my $snap_file = sub {
+        my ($snap) = @_;
+        return "$mountpoint/images/$vmid/snaps/$snap/$name";
+    };
+
+    my $src = $source_snap eq 'current' ? $live_file : $snap_file->($source_snap);
+    my $dst = $target_snap eq 'current' ? $live_file : $snap_file->($target_snap);
+
+    die "rename_snapshot: source $src does not exist\n" unless -e $src;
+    die "rename_snapshot: target $dst already exists\n" if -e $dst;
+
+    # For snapshot-named targets, make sure the per-snap directory exists.
+    if ($target_snap ne 'current') {
+        my $snapdir = "$mountpoint/images/$vmid/snaps/$target_snap";
+        File::Path::make_path($snapdir);
+    }
+
+    # Wrap in with_nbd_unmapped since renaming a file that backs an active NBD
+    # mapping would desync the mfsbdev daemon. For the 'current' → snap case
+    # this unmaps the live device, moves the file, then remaps the (now new)
+    # live file — which is exactly the semantics PVE expects for 'mixed' mode.
+    return $class->with_nbd_unmapped($scfg, $volname, sub {
+        rename($src, $dst)
+            or die "rename_snapshot: failed to move $src -> $dst: $!\n";
+
+        # Clean up a now-empty source snap directory.
+        if ($source_snap ne 'current') {
+            my $src_dir = "$mountpoint/images/$vmid/snaps/$source_snap";
+            rmdir $src_dir;  # best-effort; fails silently if non-empty
+        }
+        return undef;
+    });
+}
+
 sub volume_export {
     my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot, $with_snapshots) = @_;
 
