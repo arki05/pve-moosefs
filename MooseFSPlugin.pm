@@ -1181,10 +1181,27 @@ sub with_nbd_unmapped {
         my $map_cmd = $scfg->{mfsnbdlink}
             ? ['/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path, '-s', $size_bytes]
             : ['/usr/sbin/mfsbdev', 'map', '-f', $mfs_path, '-s', $size_bytes];
-        eval { run_command($map_cmd, errmsg => "Failed to remap $mfs_path after snapshot operation"); };
-        if ($@) {
-            log_debug "[with_nbd_unmapped] ERROR: Failed to remap after snapshot: $@";
-            die "Snapshot operation succeeded but failed to remap NBD device: $@";
+
+        # Retry the remap on transient "No such file" errors. Right after
+        # a rename/snapshot-promote via FUSE, mfsbdev's own MooseFS client
+        # session can briefly see stale metadata and fail to open a file
+        # that exists from the FUSE view. The drift window is short (~ms).
+        my @delays = (0, 0.05, 0.1, 0.2, 0.5);
+        my $map_err;
+        for my $delay (@delays) {
+            select(undef, undef, undef, $delay) if $delay > 0;
+            $map_err = undef;
+            eval { run_command($map_cmd, errmsg => "Failed to remap $mfs_path after snapshot operation"); };
+            if (!$@) {
+                last;
+            }
+            $map_err = $@;
+            last unless $map_err =~ /No such file or directory/;
+            log_debug "[with_nbd_unmapped] remap transient miss, retrying after ${delay}s";
+        }
+        if ($map_err) {
+            log_debug "[with_nbd_unmapped] ERROR: Failed to remap after snapshot: $map_err";
+            die "Snapshot operation succeeded but failed to remap NBD device: $map_err";
         }
 
         log_debug "[with_nbd_unmapped] Successfully remapped $volname to NBD device";
