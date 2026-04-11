@@ -1102,8 +1102,39 @@ sub volume_resize {
     return undef;
 }
 
+# Return the first pid holding an open fd to $nbd_device, or 0 if none.
+# Used to refuse destructive unmaps while a VM is actively using the device.
+sub nbd_device_holder_pid {
+    my ($nbd_device) = @_;
+
+    opendir(my $proc, '/proc') or return 0;
+    my @pids = grep { /^(\d+)$/ } readdir($proc);
+    closedir($proc);
+
+    for my $pid (@pids) {
+        $pid =~ /^(\d+)$/ or next;
+        $pid = $1;
+        my $fd_dir = "/proc/$pid/fd";
+        opendir(my $fdh, $fd_dir) or next;
+        while (my $fd = readdir($fdh)) {
+            next if $fd eq '.' || $fd eq '..';
+            my $link = readlink("$fd_dir/$fd");
+            next unless defined $link;
+            if ($link eq $nbd_device) {
+                closedir($fdh);
+                return $pid;
+            }
+        }
+        closedir($fdh);
+    }
+    return 0;
+}
+
 # Helper function to execute operations with NBD device temporarily unmapped
-# This is critical for snapshot operations to avoid crashing the NBD daemon
+# This is critical for snapshot operations to avoid crashing the NBD daemon.
+# Refuses the operation if the NBD device is currently held open by another
+# process (e.g. a running VM), since unmapping under a live qemu would
+# corrupt the VM's view of the disk (see issue #58).
 sub with_nbd_unmapped {
     my ($class, $scfg, $volname, $operation) = @_;
 
@@ -1140,6 +1171,16 @@ sub with_nbd_unmapped {
             if ($line =~ /\bfile:\s*\Q$mfs_path\E\b.*?\bdevice:\s*(\/dev\/nbd\d+)/) {
                 $was_mapped = 1;
                 $nbd_device = $1;
+
+                # Refuse to unmap a device that's currently in use (e.g. by a
+                # running VM). Unmapping under live qemu corrupts the disk
+                # view and leaves the NBD device in an unrecoverable state.
+                if (my $holder = nbd_device_holder_pid($nbd_device)) {
+                    die "Refusing to unmap $nbd_device for snapshot operation on $volname: "
+                        . "device is currently held open by pid $holder (likely a running VM). "
+                        . "Stop the VM before taking a snapshot.\n";
+                }
+
                 log_debug "[with_nbd_unmapped] Volume $volname is mapped to $nbd_device, unmapping before snapshot operation";
 
                 # Unmap the device to prevent NBD daemon crash during snapshot
