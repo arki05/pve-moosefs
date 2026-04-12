@@ -6,7 +6,7 @@ use warnings;
 use Data::Dumper qw(Dumper);
 use IO::File;
 use IO::Socket::UNIX;
-use File::Path;
+use File::Path qw(make_path);
 use File::Basename;
 use POSIX qw(strftime);
 
@@ -54,12 +54,12 @@ sub moosefs_is_mounted {
     return undef;
 }
 
-# Returns true only if /dev/mfs/nbdsock exists _and_ we can open() it as a UNIX stream.
+# Returns true only if the socket (mfsnbdlink or default) exists _and_ we can open() it as a UNIX stream.
 sub moosefs_bdev_is_active {
     my ($scfg) = @_;
     die "Invalid config: expected hashref" unless ref($scfg) eq 'HASH';
 
-    my $sockpath = '/dev/mfs/nbdsock';
+    my $sockpath = $scfg->{mfsnbdlink} // '/dev/mfs/nbdsock';
 
     # Quick check: does the file exist and is it a socket?
     return unless -e $sockpath && -S $sockpath;
@@ -115,7 +115,17 @@ sub moosefs_start_bdev {
     if (defined $mfspassword) {
         push @$cmd, '-p', $mfspassword;
     }
-    
+
+    # Add custom socket link if specified (for per-storage daemons)
+    if (defined $scfg->{mfsnbdlink}) {
+        # Ensure the parent directory exists (e.g. /dev/mfs/)
+        my $sockdir = dirname($scfg->{mfsnbdlink});
+        if (! -d $sockdir) {
+            make_path($sockdir) or die "Cannot create socket directory '$sockdir': $!\n";
+        }
+        push @$cmd, '-l', $scfg->{mfsnbdlink};
+    }
+
     push @$cmd, '-o', 'mfsioretries=99999999';
 
     eval { run_command($cmd, errmsg => 'mfsbdev start failed'); };
@@ -575,7 +585,7 @@ sub free_image {
 }
 
 sub map_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname) = @_;
+    my ($class, $storeid, $scfg, $volname, $snapname, $hints) = @_;
 
     # Ensure $scfg is a hashref if it was passed as a storeid (though less likely for this internal func)
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
@@ -618,7 +628,9 @@ sub map_volume {
     my $retry_delay = 0.5; # seconds
 
     for (my $attempt = 0; $attempt < $max_retries; $attempt++) {
-        my $list_cmd = ['/usr/sbin/mfsbdev', 'list'];
+        my $list_cmd = $scfg->{mfsnbdlink}
+            ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+            : ['/usr/sbin/mfsbdev', 'list'];
         my $list_output = '';
         eval {
             run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
@@ -734,7 +746,7 @@ sub map_volume {
 }
 
 sub activate_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
 
     # Defensive - make sure $scfg is a hashref, not a storeid
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
@@ -742,9 +754,10 @@ sub activate_volume {
     log_debug "[activate-volume] Activating volume $volname";
     die "Expected hashref for \$scfg in activate_volume, got: $scfg" unless ref($scfg) eq 'HASH';
 
-    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname) if !$scfg->{mfsbdev};
+    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname, $cache, $hints)
+        if !$scfg->{mfsbdev};
 
-    $class->map_volume($storeid, $scfg, $volname, $snapname) if $scfg->{mfsbdev};
+    $class->map_volume($storeid, $scfg, $volname, $snapname, $hints) if $scfg->{mfsbdev};
 
     return 1;
 }
@@ -770,7 +783,9 @@ sub deactivate_volume {
 
     # Check if the device is actually mapped before trying to unmap
     if (moosefs_bdev_is_active($scfg)) {
-        my $list_cmd = ['/usr/sbin/mfsbdev', 'list'];
+        my $list_cmd = $scfg->{mfsnbdlink}
+            ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+            : ['/usr/sbin/mfsbdev', 'list'];
         my $list_output = '';
         eval {
             run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
@@ -966,7 +981,9 @@ sub filesystem_path {
         moosefs_start_bdev($scfg);
     }
 
-    my $cmd = ['/usr/sbin/mfsbdev', 'list'];
+    my $cmd = $scfg->{mfsnbdlink}
+        ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+        : ['/usr/sbin/mfsbdev', 'list'];
     my $output = '';
     eval {
         run_command($cmd, outfunc => sub { $output .= shift; }, errmsg => 'mfsbdev list failed');
@@ -1051,7 +1068,9 @@ sub volume_resize {
     # Step 1: Check if volume is currently mapped and unmap it
     my $was_mapped = 0;
     if (moosefs_bdev_is_active($scfg)) {
-        my $list_cmd = ['/usr/sbin/mfsbdev', 'list'];
+        my $list_cmd = $scfg->{mfsnbdlink}
+            ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+            : ['/usr/sbin/mfsbdev', 'list'];
         my $list_output = '';
         eval {
             run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
@@ -1287,7 +1306,9 @@ sub volume_export {
 
             # Check if volume is currently mapped to NBD
             if (moosefs_bdev_is_active($scfg)) {
-                my $list_cmd = ['/usr/sbin/mfsbdev', 'list'];
+                my $list_cmd = $scfg->{mfsnbdlink}
+                    ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+                    : ['/usr/sbin/mfsbdev', 'list'];
                 my $list_output = '';
                 eval {
                     run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
