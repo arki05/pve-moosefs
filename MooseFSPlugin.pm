@@ -1084,39 +1084,59 @@ sub volume_resize {
 
     my $size_bytes = $size * 1024;  # Convert KiB to bytes
 
-    # Step 1: Check if volume is currently mapped and unmap it
+    # Check if volume is currently mapped to an NBD device
     my $was_mapped = 0;
+    my $nbd_device = undef;
     if (moosefs_bdev_is_active($scfg)) {
-        my $list_cmd = ['/usr/sbin/mfsbdev', 'list'];
+        my $list_cmd = $scfg->{mfsnbdlink}
+            ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+            : ['/usr/sbin/mfsbdev', 'list'];
         my $list_output = '';
         eval {
             run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
         };
 
-        # Check if this specific volume is mapped
         for my $line (split /\r?\n/, $list_output) {
-            if ($line =~ /\bfile:\s*\Q$mfs_path\E\b/) {
+            if ($line =~ /\bfile:\s*\Q$mfs_path\E\b.*?\bdevice:\s*(\/dev\/nbd\d+)/) {
                 $was_mapped = 1;
-                log_debug "[volume_resize] Volume is currently mapped, unmapping for resize";
-
-                # Unmap before resize
-                my $unmap_cmd = $scfg->{mfsnbdlink}
-                    ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path]
-                    : ['/usr/sbin/mfsbdev', 'unmap', '-f', $mfs_path];
-                run_command($unmap_cmd, errmsg => "Failed to unmap volume before resize");
+                $nbd_device = $1;
                 last;
             }
         }
     }
 
-    # Step 2: Resize the actual file
+    # If mapped and a loop device is attached (running LXC), use in-place resize.
+    # Unmap/remap would orphan the loop device and cause I/O errors + data corruption.
+    if ($was_mapped && $nbd_device && nbd_has_loop_holder($nbd_device)) {
+        log_debug "[volume_resize] Loop device attached to $nbd_device (LXC running), using in-place resize";
+
+        run_command(['truncate', '-s', $size_bytes, $full_path],
+            errmsg => "Failed to resize image file");
+
+        my $resize_cmd = $scfg->{mfsnbdlink}
+            ? ['/usr/sbin/mfsbdev', 'resize', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path, '-s', $size_bytes]
+            : ['/usr/sbin/mfsbdev', 'resize', '-f', $mfs_path, '-s', $size_bytes];
+        run_command($resize_cmd, errmsg => "mfsbdev in-place resize failed");
+
+        log_debug "[volume_resize] In-place resize of $volname to $size_bytes bytes complete";
+        return undef;
+    }
+
+    # Standard path: unmap, resize file, remap
+    if ($was_mapped) {
+        log_debug "[volume_resize] Volume is mapped, unmapping for resize";
+        my $unmap_cmd = $scfg->{mfsnbdlink}
+            ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path]
+            : ['/usr/sbin/mfsbdev', 'unmap', '-f', $mfs_path];
+        run_command($unmap_cmd, errmsg => "Failed to unmap volume before resize");
+    }
+
     log_debug "[volume_resize] Resizing file $full_path to $size_bytes bytes";
     eval {
         run_command(['truncate', '-s', $size_bytes, $full_path],
             errmsg => "Failed to resize image file");
     };
     if ($@) {
-        # If resize failed and volume was mapped, try to remap it
         if ($was_mapped) {
             log_debug "[volume_resize] Resize failed, attempting to remap volume";
             eval {
@@ -1129,7 +1149,6 @@ sub volume_resize {
         die "Failed to resize file: $@";
     }
 
-    # Step 3: Remap with new size if it was mapped before
     if ($was_mapped) {
         log_debug "[volume_resize] Remapping volume with new size";
         my $map_cmd = $scfg->{mfsnbdlink}
@@ -1138,7 +1157,7 @@ sub volume_resize {
         run_command($map_cmd, errmsg => 'mfsbdev map failed after resize');
     }
 
-    log_debug "[volume_resize] Successfully resized $volname to $size KiB ($size_bytes bytes)";
+    log_debug "[volume_resize] Successfully resized $volname to $size_bytes bytes";
 
     return undef;
 }
@@ -1185,6 +1204,34 @@ sub nbd_device_holder_pid {
         closedir($fdh);
     }
     return 0;
+}
+
+# Check if a loop device is backed by the given NBD device via sysfs.
+# LXC containers use loop devices (e.g. /dev/loop0) on top of NBD devices,
+# so an fd scan of /proc won't catch them — the kernel block layer owns
+# the backing relationship, not userspace fds. Unmapping the NBD device
+# while a loop device is still attached causes I/O errors and data corruption.
+sub nbd_has_loop_holder {
+    my ($nbd_device) = @_;
+
+    my $sysfs = '/sys/block';
+    opendir(my $dh, $sysfs) or return undef;
+    while (my $dev = readdir($dh)) {
+        next unless $dev =~ /^loop\d+$/;
+        my $backing_file = "$sysfs/$dev/loop/backing_file";
+        next unless -e $backing_file;
+        if (open(my $fh, '<', $backing_file)) {
+            my $backing = <$fh>;
+            close $fh;
+            chomp $backing if defined $backing;
+            if (defined $backing && $backing eq $nbd_device) {
+                closedir($dh);
+                return "/dev/$dev";
+            }
+        }
+    }
+    closedir($dh);
+    return undef;
 }
 
 # Helper function to execute operations with NBD device temporarily unmapped
@@ -1236,6 +1283,18 @@ sub with_nbd_unmapped {
                     die "Refusing to unmap $nbd_device for snapshot operation on $volname: "
                         . "device is currently held open by pid $holder (likely a running VM). "
                         . "Stop the VM before taking a snapshot.\n";
+                }
+
+                # Check for loop devices backed by this NBD device (LXC containers).
+                # Unmapping the NBD while a loop device is attached causes I/O errors
+                # and data corruption. For LXC we skip the unmap and run the operation
+                # directly — mfsmakesnapshot is a metadata-only COW op that is safe.
+                if (my $loop_dev = nbd_has_loop_holder($nbd_device)) {
+                    log_debug "[with_nbd_unmapped] NBD device $nbd_device has loop holder $loop_dev (LXC), skipping unmap";
+                    my $result = eval { $operation->() };
+                    my $op_error = $@;
+                    die $op_error if $op_error;
+                    return $result;
                 }
 
                 log_debug "[with_nbd_unmapped] Volume $volname is mapped to $nbd_device, unmapping before snapshot operation";
