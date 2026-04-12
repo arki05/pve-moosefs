@@ -220,7 +220,7 @@ sub moosefs_unmount {
 }
 
 sub api {
-    return 12;
+    return 13;
 }
 
 sub type {
@@ -828,7 +828,8 @@ sub path {
     # FIX #51: TPM state files require special handling - they must be directory paths
     # Windows TPM expects specific file:// protocol paths that must be absolute
     if (defined $volname && $volname =~ /tpm/i) {
-        my $tpm_path = $class->filesystem_path($scfg, $volname, $snapname);
+        my ($tpm_path, $tpm_vmid, $tpm_vtype) =
+            $class->filesystem_path($scfg, $volname, $snapname);
 
         # For TPM state files, ensure the directory exists with proper permissions
         if ($tpm_path && $tpm_path =~ /tpmstate/) {
@@ -849,7 +850,7 @@ sub path {
             log_debug "[path] TPM state path resolved to: $tpm_path";
         }
 
-        return $tpm_path;
+        return wantarray ? ($tpm_path, $tpm_vmid, $tpm_vtype) : $tpm_path;
     }
 
     # fallback to default if bdev not enabled
@@ -938,7 +939,8 @@ sub filesystem_path {
     # Skip NBD mapping for TPM state volumes - they need direct filesystem paths (directories)
     if ($name && $name =~ /^vm-\d+-tpmstate/) {
         log_debug "[filesystem_path] Returning direct path for TPM state volume $volname";
-        return "$scfg->{path}/images/$vmid/$name";
+        my $tpm_path = "$scfg->{path}/images/$vmid/$name";
+        return wantarray ? ($tpm_path, $vmid, $vtype) : $tpm_path;
     }
 
     # Handle snapshots for raw format in MooseFS
@@ -946,7 +948,8 @@ sub filesystem_path {
         # MooseFS supports snapshots for raw files through mfsmakesnapshot
         # Return the path to the snapshot file
         my $mountpoint = $scfg->{path};
-        return "$mountpoint/images/$vmid/snaps/$snapname/$name";
+        my $snap_path = "$mountpoint/images/$vmid/snaps/$snapname/$name";
+        return wantarray ? ($snap_path, $vmid, $vtype) : $snap_path;
     }
 
     # Only do NBD logic for raw images without snapshots
@@ -976,11 +979,12 @@ sub filesystem_path {
     if ($output =~ m|file:\s+\Q$path\E\s+;\s+device:\s+(/dev/nbd\d+)|) {
         my $nbd = $1;
         log_debug "[fs-path] Found mapped device: $nbd";
-        return $nbd;
+        return wantarray ? ($nbd, $vmid, $vtype) : $nbd;
     }
 
     log_debug "[fs-path] No mapped device found, falling back to $scfg->{path}$path";
-    return "$scfg->{path}$path";
+    my $fallback = "$scfg->{path}$path";
+    return wantarray ? ($fallback, $vmid, $vtype) : $fallback;
 }
 
 # Query mfsbdev for volume size by parsing 'mfsbdev list' output
@@ -1021,7 +1025,7 @@ sub volume_resize {
         Carp::confess("[${\__PACKAGE__}::$0] called with invalid volname: " . (defined $volname ? ref($volname) : 'undef'));
     }
 
-    log_debug "[volume_resize] Resizing $volname to $size KiB";
+    log_debug "[volume_resize] Resizing $volname to $size bytes";
 
     # Defensive - make sure $scfg is a hashref, not a storeid
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
@@ -1041,7 +1045,8 @@ sub volume_resize {
 
     log_debug "[volume_resize] Resizing mfsbdev volume: $mfs_path";
 
-    my $size_bytes = $size * 1024;  # Convert KiB to bytes
+    # PVE passes $size in bytes to volume_resize (not KiB).
+    my $size_bytes = $size;
 
     # Step 1: Check if volume is currently mapped and unmap it
     my $was_mapped = 0;
