@@ -220,7 +220,7 @@ sub moosefs_unmount {
 }
 
 sub api {
-    return 12;
+    return 13;
 }
 
 sub type {
