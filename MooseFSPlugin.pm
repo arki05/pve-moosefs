@@ -1419,21 +1419,20 @@ sub volume_snapshot_rollback {
     });
 }
 
-# Declare how running-VM snapshots should be handled. For raw mfsbdev volumes
-# we use 'mixed' mode: qemu closes the volume, we perform an offline MooseFS
-# snapshot (unmap, mfsmakesnapshot, remap), then qemu reopens it. This is what
-# allows snapshot operations on running VMs without the NBD-crash of issue #58.
-# Non-mfsbdev volumes fall through to the base class, which returns 'qemu' for
-# qcow2 and 'storage' for raw on plain file storage.
+# For raw mfsbdev volumes, return undef so PVE uses 'storage' mode: the VM
+# is briefly paused, volume_snapshot performs a MooseFS COW snapshot via
+# mfsmakesnapshot, then the VM resumes. 'mixed' mode (external qemu snapshot
+# with backing chain) does not work for raw/host_device — QEMU's blockdev-add
+# rejects the 'backing' parameter on non-qcow2 formats.
+# Non-mfsbdev qcow2 volumes fall through to the base class ('qemu' = internal).
 sub volume_qemu_snapshot_method {
     my ($class, $storeid, $scfg, $volname) = @_;
 
     if ($scfg->{mfsbdev}) {
         my ($vtype, undef, undef, undef, undef, undef, $format) =
             eval { $class->parse_volname($volname) };
-        if (!$@ && $vtype eq 'images' && $format eq 'raw') {
-            return 'mixed';
-        }
+        # Raw mfsbdev: use 'storage' mode (brief VM pause, not external overlay)
+        return undef if !$@ && $vtype eq 'images' && $format eq 'raw';
     }
 
     return $class->SUPER::volume_qemu_snapshot_method($storeid, $scfg, $volname);
