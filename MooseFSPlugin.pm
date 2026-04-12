@@ -1256,21 +1256,19 @@ sub with_nbd_unmapped {
                 $was_mapped = 1;
                 $nbd_device = $1;
 
-                # Refuse to unmap a device that's currently in use (e.g. by a
-                # running VM). Unmapping under live qemu corrupts the disk
-                # view and leaves the NBD device in an unrecoverable state.
-                if (my $holder = nbd_device_holder_pid($nbd_device)) {
-                    die "Refusing to unmap $nbd_device for snapshot operation on $volname: "
-                        . "device is currently held open by pid $holder (likely a running VM). "
-                        . "Stop the VM before taking a snapshot.\n";
-                }
-
-                # Check for loop devices backed by this NBD device (LXC containers).
-                # Unmapping the NBD while a loop device is attached causes I/O errors
-                # and data corruption. For LXC we skip the unmap and run the operation
-                # directly — mfsmakesnapshot is a metadata-only COW op that is safe.
-                if (my $loop_dev = nbd_has_loop_holder($nbd_device)) {
-                    log_debug "[with_nbd_unmapped] NBD device $nbd_device has loop holder $loop_dev (LXC), skipping unmap";
+                # If the device is held by another process (running QEMU VM)
+                # or by a loop device (running LXC container), skip the unmap
+                # and run the operation directly. mfsmakesnapshot is a
+                # metadata-only COW op at the MooseFS level — it does not need
+                # the NBD device unmapped. Unmapping under a live consumer
+                # would corrupt its view of the disk.
+                my $holder = nbd_device_holder_pid($nbd_device);
+                my $loop_dev = nbd_has_loop_holder($nbd_device);
+                if ($holder || $loop_dev) {
+                    my $reason = $holder
+                        ? "held by pid $holder"
+                        : "loop device $loop_dev attached";
+                    log_debug "[with_nbd_unmapped] NBD $nbd_device in use ($reason), skipping unmap";
                     my $result = eval { $operation->() };
                     my $op_error = $@;
                     die $op_error if $op_error;
