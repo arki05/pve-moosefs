@@ -743,12 +743,14 @@ sub map_volume {
             }
 
             if ($error =~ /can't find free NBD device/) {
-                log_debug "No free NBD devices available. Consider increasing max_part parameter for nbd module";
+                warn "[moosefs] No free NBD devices for $volname — falling back to FUSE path. "
+                    . "Consider increasing nbds_max (modprobe nbd nbds_max=64)\n";
+                return $class->SUPER::filesystem_path($scfg, $volname, $snapname);
             }
 
             # If we've exhausted retries or hit a different error, fall back
             if ($attempt == $map_retries - 1) {
-                log_debug "Failed to map after $map_retries attempts, falling back to filesystem path";
+                warn "[moosefs] Failed to map $volname to NBD after $map_retries attempts, using FUSE fallback\n";
                 return $class->SUPER::filesystem_path($scfg, $volname, $snapname);
             }
         }
