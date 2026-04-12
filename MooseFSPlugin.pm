@@ -54,12 +54,12 @@ sub moosefs_is_mounted {
     return undef;
 }
 
-# Returns true only if /dev/mfs/nbdsock exists _and_ we can open() it as a UNIX stream.
+# Returns true only if the socket (mfsnbdlink or default) exists _and_ we can open() it as a UNIX stream.
 sub moosefs_bdev_is_active {
     my ($scfg) = @_;
     die "Invalid config: expected hashref" unless ref($scfg) eq 'HASH';
 
-    my $sockpath = '/dev/mfs/nbdsock';
+    my $sockpath = $scfg->{mfsnbdlink} // '/dev/mfs/nbdsock';
 
     # Quick check: does the file exist and is it a socket?
     return unless -e $sockpath && -S $sockpath;
@@ -115,7 +115,12 @@ sub moosefs_start_bdev {
     if (defined $mfspassword) {
         push @$cmd, '-p', $mfspassword;
     }
-    
+
+    # Add custom socket link if specified (for per-storage daemons)
+    if (defined $scfg->{mfsnbdlink}) {
+        push @$cmd, '-l', $scfg->{mfsnbdlink};
+    }
+
     push @$cmd, '-o', 'mfsioretries=99999999';
 
     eval { run_command($cmd, errmsg => 'mfsbdev start failed'); };
