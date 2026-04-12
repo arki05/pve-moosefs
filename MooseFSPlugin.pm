@@ -509,31 +509,11 @@ sub alloc_image {
         die $@;
     }
 
-    # Check if NBD module is loaded before trying to map
-    my $nbd_loaded = system("lsmod | grep -q '^nbd '") == 0;
-    if (!$nbd_loaded) {
-        # Try to load the nbd module
-        eval { run_command(['modprobe', 'nbd', 'max_part=16'], errmsg => 'Failed to load nbd module'); };
-        if ($@) {
-            # Clean up the file we just created
-            unlink $full_path;
-            die "NBD kernel module not loaded. Please run: modprobe nbd max_part=16\n";
-        }
-    }
-
-    # Now map the file to an NBD device
-    my $cmd = $scfg->{mfsnbdlink}
-        ? ['/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $path, '-s', $size_bytes]
-        : ['/usr/sbin/mfsbdev', 'map', '-f', $path, '-s', $size_bytes];
-    eval { run_command($cmd, errmsg => 'mfsbdev map failed'); };
-    if ($@) {
-        # Clean up the file on mapping failure
-        unlink $full_path;
-        if ($@ =~ /can't find free NBD device/) {
-            die "No free NBD devices available. Check if nbd module is loaded (lsmod | grep nbd) and increase max_part if needed\n";
-        }
-        die $@;
-    }
+    # Do NOT map to NBD here. The mapping will happen lazily via
+    # activate_volume -> map_volume when the volume is first used.
+    # Eager mapping causes symlink collisions in /dev/mfs/ during disk
+    # moves between pools on the same MooseFS master, because the source
+    # volume is still mapped with the same link name.
 
     return "$vmid/$name";
 }
@@ -1188,7 +1168,7 @@ sub nbd_device_holder_pid {
             close $cf;
             chomp $comm if defined $comm;
         }
-        next if defined $comm && $comm eq 'mfsbdev';
+        next if defined $comm && ($comm eq 'mfsbdev' || $comm eq 'systemd-udevd');
 
         my $fd_dir = "/proc/$pid/fd";
         opendir(my $fdh, $fd_dir) or next;
