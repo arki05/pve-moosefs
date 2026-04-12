@@ -6,6 +6,14 @@ PATCH_FILE="/usr/share/libpve-storage-custom-moosefs-perl/pve-moosefs.patch"
 
 case "$1" in
     configure)
+        # Reload systemd so the pvestatd KillMode=mixed drop-in takes effect
+        # (see issue #60). We intentionally do NOT restart pvestatd here — the
+        # drop-in only matters on the NEXT restart, and doing it now would
+        # defeat the purpose by killing the currently-running mfsmount.
+        if [ -d /run/systemd/system ] && type systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+
         if [ -f "$TARGET_FILE" ] && ! grep -q "moosefs:" "$TARGET_FILE"; then
             echo "Applying MooseFS patch to $TARGET_FILE"
             
