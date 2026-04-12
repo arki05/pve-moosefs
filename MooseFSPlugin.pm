@@ -1311,6 +1311,25 @@ sub activate_storage {
         moosefs_start_bdev($scfg);
     }
 
+    # Clean up stale NBD mappings: volumes whose backing file no longer exists.
+    # This catches leaks from races (concurrent stop+destroy), crashed daemons,
+    # or manual file deletions. Runs on each pvestatd activation cycle.
+    if ($scfg->{mfsbdev} && moosefs_bdev_is_active($scfg)) {
+        my $mappings = eval { moosefs_bdev_list_mappings($scfg) };
+        if (!$@ && $mappings) {
+            for my $mfs_path (keys %$mappings) {
+                my $full = "$path$mfs_path";
+                next if -e $full;
+                log_debug "[activate_storage] Cleaning stale mapping: $mfs_path -> $mappings->{$mfs_path}";
+                my $unmap = $scfg->{mfsnbdlink}
+                    ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path]
+                    : ['/usr/sbin/mfsbdev', 'unmap', '-f', $mfs_path];
+                eval { run_command($unmap, errmsg => "stale unmap failed for $mfs_path"); };
+                warn "Failed to clean stale mapping $mfs_path: $@" if $@;
+            }
+        }
+    }
+
     $class->SUPER::activate_storage($storeid, $scfg, $cache);
 }
 
