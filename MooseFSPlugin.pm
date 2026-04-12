@@ -621,13 +621,12 @@ sub map_volume {
     # Ensure $scfg is a hashref if it was passed as a storeid (though less likely for this internal func)
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
 
-    # This function's NBD mapping logic is only relevant if mfsbdev is enabled.
+    # NBD mapping only relevant if mfsbdev is enabled and not a snapshot
     if (!ref($scfg) || !$scfg->{mfsbdev}) {
-        log_debug "[map_volume] mfsbdev not enabled or invalid scfg. Path: $scfg->{path}. Volname: $volname. Returning undef.";
         return undef;
     }
+    return undef if defined($snapname);
 
-    # Return early if volname is undefined
     unless (defined $volname) {
         log_debug "[map_volume] volname is undefined, skipping";
         # Or, perhaps fall back to a SUPER call if appropriate for this method
@@ -643,7 +642,8 @@ sub map_volume {
     }
 
     # Only handle raw format image volumes
-    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname) if $vtype ne 'images' || $format ne 'raw';
+    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname)
+        if $vtype ne 'images' || $format ne 'raw';
 
     # Construct the MooseFS path from the parsed components
     my $mfs_path = "/images/$vmid/$name";
@@ -768,16 +768,13 @@ sub map_volume {
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
 
-    # Defensive - make sure $scfg is a hashref, not a storeid
     $scfg = PVE::Storage::config()->{ids}->{$storeid} unless ref($scfg) eq 'HASH';
 
-    log_debug "[activate-volume] Activating volume $volname";
-    die "Expected hashref for \$scfg in activate_volume, got: $scfg" unless ref($scfg) eq 'HASH';
-
+    # Snapshots are accessed via the FUSE path, not NBD — skip map_volume
     return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname, $cache, $hints)
-        if !$scfg->{mfsbdev};
+        if !$scfg->{mfsbdev} || defined($snapname);
 
-    $class->map_volume($storeid, $scfg, $volname, $snapname, $hints) if $scfg->{mfsbdev};
+    $class->map_volume($storeid, $scfg, $volname, $snapname, $hints);
 
     return 1;
 }
@@ -801,20 +798,8 @@ sub deactivate_volume {
 
     my $path = "/images/$vmid/$name";
 
-    # Check if the device is actually mapped before trying to unmap
-    if (moosefs_bdev_is_active($scfg)) {
-        my $mappings = eval { moosefs_bdev_list_mappings($scfg) };
-        if (!$@ && !exists $mappings->{$path}) {
-            log_debug "Volume $volname is not currently mapped, skipping deactivation";
-            return 1;
-        }
-    } else {
-        log_debug "mfsbdev daemon is not active, skipping deactivation for $volname";
-        return 1;
-    }
-
-    my $mappings = moosefs_bdev_list_mappings($scfg);
-    if (!exists $mappings->{$path}) {
+    my $mappings = eval { moosefs_bdev_list_mappings($scfg) };
+    if (!$@ && !exists $mappings->{$path}) {
         log_debug "Volume $volname is not currently mapped, skipping deactivation";
         return 1;
     }
@@ -894,6 +879,11 @@ sub path {
 
     # fallback to default if bdev not enabled
     if (!ref($scfg) || !$scfg->{mfsbdev}) {
+        return $class->filesystem_path($scfg, $volname, $snapname);
+    }
+
+    # Snapshots are always accessed via FUSE path, never NBD
+    if (defined($snapname)) {
         return $class->filesystem_path($scfg, $volname, $snapname);
     }
 
@@ -1001,62 +991,16 @@ sub filesystem_path {
     my $path = defined($vmid) ? "/images/$vmid/$name" : "/images/$name";
 
     if (!moosefs_bdev_is_active($scfg)) {
-        log_debug "MooseFS bdev not active, activating";
         moosefs_start_bdev($scfg);
     }
 
-    my $cmd = $scfg->{mfsnbdlink}
-        ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
-        : ['/usr/sbin/mfsbdev', 'list'];
-    my $output = '';
-    eval {
-        run_command($cmd, outfunc => sub { $output .= shift; }, errmsg => 'mfsbdev list failed');
-    };
-    if ($@) {
-        log_debug "[fs-path] mfsbdev list failed: $@";
-        return $class->SUPER::filesystem_path($scfg, $volname, $snapname);
-    }
-
-    if ($output =~ m|file:\s+\Q$path\E\s+;\s+device:\s+(/dev/nbd\d+)|) {
-        my $nbd = $1;
-        log_debug "[fs-path] Found mapped device: $nbd";
+    my $mappings = eval { moosefs_bdev_list_mappings($scfg) };
+    if (!$@ && (my $nbd = $mappings->{$path})) {
         return wantarray ? ($nbd, $vmid, $vtype) : $nbd;
     }
 
-    log_debug "[fs-path] No mapped device found, falling back to $scfg->{path}$path";
     my $fallback = "$scfg->{path}$path";
     return wantarray ? ($fallback, $vmid, $vtype) : $fallback;
-}
-
-# Query mfsbdev for volume size by parsing 'mfsbdev list' output
-sub get_mfsbdev_size {
-    my ($class, $scfg, $mfs_path) = @_;
-
-    return undef unless moosefs_bdev_is_active($scfg);
-
-    my $list_cmd = $scfg->{mfsnbdlink}
-        ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
-        : ['/usr/sbin/mfsbdev', 'list'];
-
-    my $list_output = '';
-    eval {
-        run_command($list_cmd, outfunc => sub { $list_output .= shift; });
-    };
-    return undef if $@;
-
-    # Parse mfsbdev list output
-    # Format: file: /images/204/vm-204-disk-0 ; device: /dev/nbd2 ; link: ... ; size: 2147483648 (2.000GiB) ; ...
-    for my $line (split /\r?\n/, $list_output) {
-        if ($line =~ /\bfile:\s*\Q$mfs_path\E\b.*?\bsize:\s*(\d+)/) {
-            my $size_bytes = $1;
-            my $size_kib = int($size_bytes / 1024);
-            log_debug "[get_mfsbdev_size] Found $mfs_path: $size_bytes bytes ($size_kib KiB)";
-            return $size_kib;
-        }
-    }
-
-    log_debug "[get_mfsbdev_size] Volume $mfs_path not found in mfsbdev list";
-    return undef;
 }
 
 sub volume_resize {
@@ -1089,286 +1033,35 @@ sub volume_resize {
     # PVE passes $size in bytes to volume_resize (not KiB).
     my $size_bytes = $size;
 
-    # Check if volume is currently mapped to an NBD device
-    my $was_mapped = 0;
-    my $nbd_device = undef;
+    # Step 1: Resize the underlying MooseFS file
+    run_command(['truncate', '-s', $size_bytes, $full_path],
+        errmsg => "Failed to resize image file");
+
+    # Step 2: If the volume is NBD-mapped, update the device size in-place.
+    # mfsbdev resize is always safe — it updates the NBD device size without
+    # unmapping, so loop devices (LXC) and QEMU consumers stay attached.
     if (moosefs_bdev_is_active($scfg)) {
-        my $list_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
-            : ['/usr/sbin/mfsbdev', 'list'];
-        my $list_output = '';
-        eval {
-            run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
-        };
-
-        for my $line (split /\r?\n/, $list_output) {
-            if ($line =~ /\bfile:\s*\Q$mfs_path\E\b.*?\bdevice:\s*(\/dev\/nbd\d+)/) {
-                $was_mapped = 1;
-                $nbd_device = $1;
-                last;
-            }
+        my $mappings = moosefs_bdev_list_mappings($scfg);
+        if (exists $mappings->{$mfs_path}) {
+            my $resize_cmd = $scfg->{mfsnbdlink}
+                ? ['/usr/sbin/mfsbdev', 'resize', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path, '-s', $size_bytes]
+                : ['/usr/sbin/mfsbdev', 'resize', '-f', $mfs_path, '-s', $size_bytes];
+            run_command($resize_cmd, errmsg => "mfsbdev in-place resize failed");
         }
     }
-
-    # If mapped and a loop device is attached (running LXC), use in-place resize.
-    # Unmap/remap would orphan the loop device and cause I/O errors + data corruption.
-    if ($was_mapped && $nbd_device && nbd_has_loop_holder($nbd_device)) {
-        log_debug "[volume_resize] Loop device attached to $nbd_device (LXC running), using in-place resize";
-
-        run_command(['truncate', '-s', $size_bytes, $full_path],
-            errmsg => "Failed to resize image file");
-
-        my $resize_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'resize', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path, '-s', $size_bytes]
-            : ['/usr/sbin/mfsbdev', 'resize', '-f', $mfs_path, '-s', $size_bytes];
-        run_command($resize_cmd, errmsg => "mfsbdev in-place resize failed");
-
-        log_debug "[volume_resize] In-place resize of $volname to $size_bytes bytes complete";
-        return undef;
-    }
-
-    # Standard path: unmap, resize file, remap
-    if ($was_mapped) {
-        log_debug "[volume_resize] Volume is mapped, unmapping for resize";
-        my $unmap_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path]
-            : ['/usr/sbin/mfsbdev', 'unmap', '-f', $mfs_path];
-        run_command($unmap_cmd, errmsg => "Failed to unmap volume before resize");
-    }
-
-    log_debug "[volume_resize] Resizing file $full_path to $size_bytes bytes";
-    eval {
-        run_command(['truncate', '-s', $size_bytes, $full_path],
-            errmsg => "Failed to resize image file");
-    };
-    if ($@) {
-        if ($was_mapped) {
-            log_debug "[volume_resize] Resize failed, attempting to remap volume";
-            eval {
-                my $remap_cmd = $scfg->{mfsnbdlink}
-                    ? ['/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path, '-s', (-s $full_path)]
-                    : ['/usr/sbin/mfsbdev', 'map', '-f', $mfs_path, '-s', (-s $full_path)];
-                run_command($remap_cmd);
-            };
-        }
-        die "Failed to resize file: $@";
-    }
-
-    if ($was_mapped) {
-        log_debug "[volume_resize] Remapping volume with new size";
-        my $map_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path, '-s', $size_bytes]
-            : ['/usr/sbin/mfsbdev', 'map', '-f', $mfs_path, '-s', $size_bytes];
-        run_command($map_cmd, errmsg => 'mfsbdev map failed after resize');
-    }
-
-    log_debug "[volume_resize] Successfully resized $volname to $size_bytes bytes";
 
     return undef;
 }
 
-# Return the first pid holding an open fd to $nbd_device, or 0 if none.
-# Used to refuse destructive unmaps while a VM is actively using the device.
-# The mfsbdev daemon is the NBD *server* for the device and always holds an
-# fd to it, so it would be a false positive — it must be excluded, otherwise
-# no snapshot of any mapped volume could ever proceed (even the 'mixed' flow
-# that unmaps explicitly via with_nbd_unmapped).
-sub nbd_device_holder_pid {
-    my ($nbd_device) = @_;
 
-    opendir(my $proc, '/proc') or return 0;
-    my @pids = grep { /^(\d+)$/ } readdir($proc);
-    closedir($proc);
-
-    for my $pid (@pids) {
-        $pid =~ /^(\d+)$/ or next;
-        $pid = $1;
-
-        # Skip the mfsbdev daemon (and its worker threads) — it's the server
-        # side of the NBD device, not a consumer. Only non-server holders
-        # like qemu/kvm should block the snapshot flow.
-        my $comm;
-        if (open(my $cf, '<', "/proc/$pid/comm")) {
-            $comm = <$cf>;
-            close $cf;
-            chomp $comm if defined $comm;
-        }
-        next if defined $comm && ($comm eq 'mfsbdev' || $comm eq 'systemd-udevd');
-
-        my $fd_dir = "/proc/$pid/fd";
-        opendir(my $fdh, $fd_dir) or next;
-        while (my $fd = readdir($fdh)) {
-            next if $fd eq '.' || $fd eq '..';
-            my $link = readlink("$fd_dir/$fd");
-            next unless defined $link;
-            if ($link eq $nbd_device) {
-                closedir($fdh);
-                return $pid;
-            }
-        }
-        closedir($fdh);
-    }
-    return 0;
-}
-
-# Check if a loop device is backed by the given NBD device via sysfs.
-# LXC containers use loop devices (e.g. /dev/loop0) on top of NBD devices,
-# so an fd scan of /proc won't catch them — the kernel block layer owns
-# the backing relationship, not userspace fds. Unmapping the NBD device
-# while a loop device is still attached causes I/O errors and data corruption.
-sub nbd_has_loop_holder {
-    my ($nbd_device) = @_;
-
-    my $sysfs = '/sys/block';
-    opendir(my $dh, $sysfs) or return undef;
-    while (my $dev = readdir($dh)) {
-        next unless $dev =~ /^loop\d+$/;
-        my $backing_file = "$sysfs/$dev/loop/backing_file";
-        next unless -e $backing_file;
-        if (open(my $fh, '<', $backing_file)) {
-            my $backing = <$fh>;
-            close $fh;
-            chomp $backing if defined $backing;
-            if (defined $backing && $backing eq $nbd_device) {
-                closedir($dh);
-                return "/dev/$dev";
-            }
-        }
-    }
-    closedir($dh);
-    return undef;
-}
-
-# Helper function to execute operations with NBD device temporarily unmapped
-# This is critical for snapshot operations to avoid crashing the NBD daemon.
-# Refuses the operation if the NBD device is currently held open by another
-# process (e.g. a running VM), since unmapping under a live qemu would
-# corrupt the VM's view of the disk (see issue #58).
-sub with_nbd_unmapped {
-    my ($class, $scfg, $volname, $operation) = @_;
-
-    my ($vtype, $name, $vmid, undef, undef, $isBase, $format) = $class->parse_volname($volname);
-
-    # Only apply NBD unmapping logic for raw images in mfsbdev mode
-    if ($vtype ne 'images' || $format ne 'raw' || !$scfg->{mfsbdev}) {
-        return $operation->();
-    }
-
-    # Untaint the path components for taint mode (required for vzdump)
-    # vmid and name are already validated by parse_volname
-    die "Invalid vmid" unless $vmid =~ /^(\d+)$/;
-    $vmid = $1;
-    die "Invalid volume name" unless $name =~ /^([-\w.]+)$/;
-    $name = $1;
-
-    my $mfs_path = "/images/$vmid/$name";
-    my $was_mapped = 0;
-    my $nbd_device = undef;
-
-    # Check if currently mapped to an NBD device
-    if (moosefs_bdev_is_active($scfg)) {
-        my $list_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
-            : ['/usr/sbin/mfsbdev', 'list'];
-        my $list_output = '';
-        eval {
-            run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
-        };
-
-        # Parse mfsbdev list output to find if this volume is mapped
-        for my $line (split /\r?\n/, $list_output) {
-            if ($line =~ /\bfile:\s*\Q$mfs_path\E\b.*?\bdevice:\s*(\/dev\/nbd\d+)/) {
-                $was_mapped = 1;
-                $nbd_device = $1;
-
-                # If the device is held by another process (running QEMU VM)
-                # or by a loop device (running LXC container), skip the unmap
-                # and run the operation directly. mfsmakesnapshot is a
-                # metadata-only COW op at the MooseFS level — it does not need
-                # the NBD device unmapped. Unmapping under a live consumer
-                # would corrupt its view of the disk.
-                my $holder = nbd_device_holder_pid($nbd_device);
-                my $loop_dev = nbd_has_loop_holder($nbd_device);
-                if ($holder || $loop_dev) {
-                    my $reason = $holder
-                        ? "held by pid $holder"
-                        : "loop device $loop_dev attached";
-                    log_debug "[with_nbd_unmapped] NBD $nbd_device in use ($reason), skipping unmap";
-                    my $result = eval { $operation->() };
-                    my $op_error = $@;
-                    die $op_error if $op_error;
-                    return $result;
-                }
-
-                log_debug "[with_nbd_unmapped] Volume $volname is mapped to $nbd_device, unmapping before snapshot operation";
-
-                # Unmap the device to prevent NBD daemon crash during snapshot
-                my $unmap_cmd = $scfg->{mfsnbdlink}
-                    ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path]
-                    : ['/usr/sbin/mfsbdev', 'unmap', '-f', $mfs_path];
-                run_command($unmap_cmd, errmsg => "Failed to unmap $mfs_path before snapshot operation");
-                last;
-            }
-        }
-    }
-
-    # Execute the snapshot operation with NBD unmapped
-    my $result = eval { $operation->() };
-    my $error = $@;
-
-    # Remap if it was mapped before
-    if ($was_mapped) {
-        log_debug "[with_nbd_unmapped] Remapping volume $volname after snapshot operation";
-
-        # Untaint scfg path for taint mode
-        my $storage_path = $scfg->{path};
-        die "Invalid storage path" unless $storage_path =~ /^(\/[-\w\/]+)$/;
-        $storage_path = $1;
-
-        # Get size from the actual file on MooseFS
-        my $image_file = "$storage_path$mfs_path";
-        if (!-e $image_file) {
-            log_debug "[with_nbd_unmapped] ERROR: Image file $image_file missing, cannot remap";
-            die "Cannot remap volume after snapshot: image file missing at $image_file";
-        }
-
-        my $size_bytes = -s $image_file;
-        if (!defined $size_bytes || $size_bytes <= 0) {
-            log_debug "[with_nbd_unmapped] ERROR: Invalid size for image file: $size_bytes";
-            die "Cannot remap volume after snapshot: invalid file size";
-        }
-
-        my $map_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path, '-s', $size_bytes]
-            : ['/usr/sbin/mfsbdev', 'map', '-f', $mfs_path, '-s', $size_bytes];
-
-        # Retry the remap on transient "No such file" errors. Right after
-        # a rename/snapshot-promote via FUSE, mfsbdev's own MooseFS client
-        # session can briefly see stale metadata and fail to open a file
-        # that exists from the FUSE view. The drift window is short (~ms).
-        my @delays = (0, 0.05, 0.1, 0.2, 0.5);
-        my $map_err;
-        for my $delay (@delays) {
-            select(undef, undef, undef, $delay) if $delay > 0;
-            $map_err = undef;
-            eval { run_command($map_cmd, errmsg => "Failed to remap $mfs_path after snapshot operation"); };
-            if (!$@) {
-                last;
-            }
-            $map_err = $@;
-            last unless $map_err =~ /No such file or directory/;
-            log_debug "[with_nbd_unmapped] remap transient miss, retrying after ${delay}s";
-        }
-        if ($map_err) {
-            log_debug "[with_nbd_unmapped] ERROR: Failed to remap after snapshot: $map_err";
-            die "Snapshot operation succeeded but failed to remap NBD device: $map_err";
-        }
-
-        log_debug "[with_nbd_unmapped] Successfully remapped $volname to NBD device";
-    }
-
-    die $error if $error;
-    return $result;
+# Untaint path components for taint-mode (-T) compatibility.
+# vzdump and other PVE tools run with taint mode; passing tainted strings to
+# run_command/IPC::Open3 causes "Insecure $ENV{PATH}" errors.
+sub _untaint_vol {
+    my ($vmid, $name) = @_;
+    ($vmid) = ($vmid =~ /^(\d+)$/) or die "Invalid vmid\n";
+    ($name) = ($name =~ /^([-\w.]+)$/) or die "Invalid volume name\n";
+    return ($vmid, $name);
 }
 
 sub volume_snapshot {
@@ -1376,28 +1069,18 @@ sub volume_snapshot {
 
     my ($storageType, $name, $vmid, $basename, $basedvmid, $isBase, $format) = $class->parse_volname($volname);
 
-    if ($format ne 'raw') {
-        return PVE::Storage::Plugin::volume_snapshot(@_);
-    }
-
+    return PVE::Storage::Plugin::volume_snapshot(@_) if $format ne 'raw';
     die "snapshots not supported for this storage type" if $storageType ne 'images';
 
-    # Wrap the snapshot operation with NBD unmapping to prevent daemon crashes
-    return $class->with_nbd_unmapped($scfg, $volname, sub {
-        my $mountpoint = $scfg->{path};
+    ($vmid, $name) = _untaint_vol($vmid, $name);
+    my $mountpoint = $scfg->{path};
+    my $snapdir = "$mountpoint/images/$vmid/snaps/$snap";
+    File::Path::make_path($snapdir);
 
-        my $snapdir = "$mountpoint/images/$vmid/snaps/$snap";
+    run_command(['/usr/bin/mfsmakesnapshot', "$mountpoint/images/$vmid/$name", "$snapdir/$name"],
+        errmsg => 'An error occurred while making the snapshot');
 
-        File::Path::make_path($snapdir);
-
-        log_debug "running '/usr/bin/mfsmakesnapshot $mountpoint/images/$vmid/$name $snapdir/$name'\n";
-
-        my $cmd = ['/usr/bin/mfsmakesnapshot', "$mountpoint/images/$vmid/$name", "$snapdir/$name"];
-
-        run_command($cmd, errmsg => 'An error occurred while making the snapshot');
-
-        return undef;
-    });
+    return undef;
 }
 
 sub volume_snapshot_delete {
@@ -1405,20 +1088,17 @@ sub volume_snapshot_delete {
 
     my ($storageType, $name, $vmid, $basename, $basedvmid, $isBase, $format) = $class->parse_volname($volname);
 
-    if ($format ne 'raw') {
-        return PVE::Storage::Plugin::volume_snapshot_delete(@_);
-    }
+    return PVE::Storage::Plugin::volume_snapshot_delete(@_) if $format ne 'raw';
 
-    # Wrap the snapshot deletion with NBD unmapping to prevent daemon crashes
-    return $class->with_nbd_unmapped($scfg, $volname, sub {
-        my $mountpoint = $scfg->{path};
+    ($vmid, $name) = _untaint_vol($vmid, $name);
+    my $mountpoint = $scfg->{path};
+    my $snapfile = "$mountpoint/images/$vmid/snaps/$snap/$name";
+    my $snapdir = "$mountpoint/images/$vmid/snaps/$snap";
 
-        my $cmd = ['/usr/bin/mfsrmsnapshot', "$mountpoint/images/$vmid/snaps/$snap/$name"];
+    unlink($snapfile) or die "Failed to delete snapshot file $snapfile: $!\n" if -e $snapfile;
+    rmdir($snapdir);  # best-effort, fails silently if non-empty
 
-        run_command($cmd, errmsg => 'An error occurred while deleting the snapshot');
-
-        return undef;
-    });
+    return undef;
 }
 
 sub volume_snapshot_rollback {
@@ -1426,22 +1106,16 @@ sub volume_snapshot_rollback {
 
     my ($storageType, $name, $vmid, $basename, $basedvmid, $isBase, $format) = $class->parse_volname($volname);
 
-    if ($format ne 'raw') {
-        return PVE::Storage::Plugin::volume_snapshot_rollback(@_);
-    }
+    return PVE::Storage::Plugin::volume_snapshot_rollback(@_) if $format ne 'raw';
 
-    # Wrap the snapshot rollback with NBD unmapping to prevent daemon crashes
-    return $class->with_nbd_unmapped($scfg, $volname, sub {
-        my $mountpoint = $scfg->{path};
+    ($vmid, $name) = _untaint_vol($vmid, $name);
+    my $mountpoint = $scfg->{path};
+    run_command(['/usr/bin/mfsmakesnapshot', '-o',
+            "$mountpoint/images/$vmid/snaps/$snap/$name",
+            "$mountpoint/images/$vmid/$name"],
+        errmsg => 'An error occurred while restoring the snapshot');
 
-        my $snapdir = "$mountpoint/images/$vmid/snaps/$snap";
-
-        my $cmd = ['/usr/bin/mfsmakesnapshot', '-o', "$snapdir/$name", "$mountpoint/images/$vmid/$name"];
-
-        run_command($cmd, errmsg => 'An error occurred while restoring the snapshot');
-
-        return undef;
-    });
+    return undef;
 }
 
 # For raw mfsbdev volumes, return undef so PVE uses 'storage' mode: the VM
@@ -1463,58 +1137,6 @@ sub volume_qemu_snapshot_method {
     return $class->SUPER::volume_qemu_snapshot_method($storeid, $scfg, $volname);
 }
 
-# Rename a snapshot directory. The special source name "current" means "the
-# live volume" — swap the live file into the named snapshot slot. Likewise a
-# target of "current" means promote a snapshot back into the live slot. This
-# is required by PVE's 'mixed' snapshot flow for merging/unhooking snapshots
-# on running VMs.
-sub rename_snapshot {
-    my ($class, $scfg, $storeid, $volname, $source_snap, $target_snap) = @_;
-
-    my ($vtype, $name, $vmid, undef, undef, undef, $format) =
-        $class->parse_volname($volname);
-
-    if ($vtype ne 'images' || $format ne 'raw') {
-        return $class->SUPER::rename_snapshot($scfg, $storeid, $volname, $source_snap, $target_snap);
-    }
-
-    my $mountpoint = $scfg->{path};
-    my $live_file  = "$mountpoint/images/$vmid/$name";
-
-    my $snap_file = sub {
-        my ($snap) = @_;
-        return "$mountpoint/images/$vmid/snaps/$snap/$name";
-    };
-
-    my $src = $source_snap eq 'current' ? $live_file : $snap_file->($source_snap);
-    my $dst = $target_snap eq 'current' ? $live_file : $snap_file->($target_snap);
-
-    die "rename_snapshot: source $src does not exist\n" unless -e $src;
-    die "rename_snapshot: target $dst already exists\n" if -e $dst;
-
-    # For snapshot-named targets, make sure the per-snap directory exists.
-    if ($target_snap ne 'current') {
-        my $snapdir = "$mountpoint/images/$vmid/snaps/$target_snap";
-        File::Path::make_path($snapdir);
-    }
-
-    # Wrap in with_nbd_unmapped since renaming a file that backs an active NBD
-    # mapping would desync the mfsbdev daemon. For the 'current' → snap case
-    # this unmaps the live device, moves the file, then remaps the (now new)
-    # live file — which is exactly the semantics PVE expects for 'mixed' mode.
-    return $class->with_nbd_unmapped($scfg, $volname, sub {
-        rename($src, $dst)
-            or die "rename_snapshot: failed to move $src -> $dst: $!\n";
-
-        # Clean up a now-empty source snap directory.
-        if ($source_snap ne 'current') {
-            my $src_dir = "$mountpoint/images/$vmid/snaps/$source_snap";
-            rmdir $src_dir;  # best-effort; fails silently if non-empty
-        }
-        return undef;
-    });
-}
-
 sub volume_export {
     my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot, $with_snapshots) = @_;
 
@@ -1528,35 +1150,16 @@ sub volume_export {
         if ($vtype eq 'images' && $file_format eq 'raw') {
             my $mfs_path = "/images/$vmid/$name";
 
-            # Check if volume is currently mapped to NBD
-            if (moosefs_bdev_is_active($scfg)) {
-                my $list_cmd = $scfg->{mfsnbdlink}
-                    ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
-                    : ['/usr/sbin/mfsbdev', 'list'];
-                my $list_output = '';
-                eval {
-                    run_command($list_cmd, outfunc => sub { $list_output .= shift; }, errmsg => 'mfsbdev list failed');
-                };
-
-                # Check if this specific volume is mapped
-                my $is_mapped = 0;
-                for my $line (split /\r?\n/, $list_output) {
-                    if ($line =~ /\bfile:\s*\Q$mfs_path\E\b/) {
-                        $is_mapped = 1;
-                        last;
-                    }
-                }
-
-                if ($is_mapped) {
-                    log_debug "[volume_export] Unmapping NBD device for $volname before migration export";
-                    my $unmap_cmd = $scfg->{mfsnbdlink}
-                        ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path]
-                        : ['/usr/sbin/mfsbdev', 'unmap', '-f', $mfs_path];
-                    eval { run_command($unmap_cmd, errmsg => "Failed to unmap $mfs_path before export"); };
-                    if ($@) {
-                        log_debug "[volume_export] WARNING: Failed to unmap volume before export: $@";
-                        # Don't fail the export if unmap fails - volume might not be in use
-                    }
+            # Unmap NBD device before export to ensure clean migration
+            my $mappings = eval { moosefs_bdev_list_mappings($scfg) };
+            if (!$@ && exists $mappings->{$mfs_path}) {
+                log_debug "[volume_export] Unmapping NBD device for $volname before migration export";
+                my $unmap_cmd = $scfg->{mfsnbdlink}
+                    ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $mfs_path]
+                    : ['/usr/sbin/mfsbdev', 'unmap', '-f', $mfs_path];
+                eval { run_command($unmap_cmd, errmsg => "Failed to unmap $mfs_path before export"); };
+                if ($@) {
+                    log_debug "[volume_export] WARNING: Failed to unmap volume before export: $@";
                 }
             }
         }
