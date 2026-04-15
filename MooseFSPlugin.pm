@@ -528,6 +528,58 @@ sub alloc_image {
     return "$vmid/$name";
 }
 
+# Remove any snapshot files that belong to $parsed_name under $vmid, plus
+# empty snap/ and VMID directories. PVE destroys snapshots by calling
+# volume_snapshot_delete before free_image, but under `qm destroy --purge`
+# against a guest whose config still lists snapshots those calls don't
+# reliably fire — leaving orphaned files at {vmid}/snaps/{snap}/{name}.
+# The stale files break the next consumer of the VMID: snapshot_create
+# aborts with "File exists" and VMID reuse is effectively broken.
+# Mirrors BTRFSPlugin::free_image, which enumerates snapshots of the
+# subvolume and drops them alongside the main volume.
+sub _cleanup_vmid_residuals {
+    my ($scfg, $vmid, $parsed_name) = @_;
+
+    my $snaps_root = "$scfg->{path}/images/$vmid/snaps";
+    if (-d $snaps_root) {
+        if (opendir(my $sh, $snaps_root)) {
+            my @snap_names = grep { $_ ne '.' && $_ ne '..' } readdir($sh);
+            closedir($sh);
+            for my $snap_name (@snap_names) {
+                my $snap_dir  = "$snaps_root/$snap_name";
+                my $snap_file = "$snap_dir/$parsed_name";
+                if (-e $snap_file) {
+                    log_debug "[free_image] Cleaning up orphaned snapshot $snap_file";
+                    unlink($snap_file)
+                        or log_debug "[free_image] Failed to unlink $snap_file: $!";
+                }
+                # Best-effort: rmdir succeeds if this was the only disk in
+                # the snapshot; no-ops otherwise (multi-disk VMs share
+                # snap dirs across their disks).
+                rmdir($snap_dir);
+            }
+        } else {
+            log_debug "[free_image] Cannot open snapshots directory $snaps_root: $!";
+        }
+        rmdir($snaps_root);
+    }
+
+    my $image_dir_path = "$scfg->{path}/images/$vmid";
+    if (-d $image_dir_path) {
+        if (opendir(my $dh, $image_dir_path)) {
+            my @contents = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+            closedir($dh);
+            if (@contents == 0) {
+                log_debug "[free_image] Removing empty VM directory: $image_dir_path";
+                rmdir($image_dir_path)
+                    or log_debug "[free_image] Failed to remove $image_dir_path: $!";
+            }
+        } else {
+            log_debug "[free_image] Cannot open directory $image_dir_path: $!";
+        }
+    }
+}
+
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format_param) = @_;
 
@@ -546,7 +598,9 @@ sub free_image {
     if (!$scfg->{mfsbdev} || $vtype ne 'images') {
         my $reason = !$scfg->{mfsbdev} ? "mfsbdev_disabled" : "vtype_not_images ('$vtype')";
         log_debug "[free_image] Vol: $volname. Reason: $reason. Using SUPER::free_image.";
-        return $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        my $res = $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        _cleanup_vmid_residuals($scfg, $vmid, $parsed_name) if $vtype eq 'images';
+        return $res;
     }
 
     # --- mfsbdev is ON and vtype IS 'images' ---
@@ -594,23 +648,12 @@ sub free_image {
         # deletion. The helper above already dies on list failures, so we know
         # "not in $mappings" is an authoritative answer, not a silent error.
         log_debug "[free_image] Vol: $volname is not NBD-mapped. Using SUPER::free_image.";
-        return $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        my $res = $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        _cleanup_vmid_residuals($scfg, $vmid, $parsed_name);
+        return $res;
     }
 
-    # Remove empty VM image directory to prevent future allocation issues
-    my $image_dir_path = "$scfg->{path}/images/$vmid";
-    if (-d $image_dir_path) {
-        opendir(my $dh, $image_dir_path) or log_debug "[free_image] Cannot open directory $image_dir_path: $!";
-        if ($dh) {
-            my @contents = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
-            closedir($dh);
-
-            if (@contents == 0) {
-                log_debug "[free_image] Removing empty VM directory: $image_dir_path";
-                rmdir($image_dir_path) or log_debug "[free_image] Failed to remove empty directory $image_dir_path: $!";
-            }
-        }
-    }
+    _cleanup_vmid_residuals($scfg, $vmid, $parsed_name);
 
     return undef;
 }
