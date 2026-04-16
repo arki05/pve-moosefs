@@ -528,6 +528,54 @@ sub alloc_image {
     return "$vmid/$name";
 }
 
+# Remove orphaned snapshot files for $parsed_name under $vmid, then
+# best-effort rmdir the empty snap/ and VMID directories. PVE's
+# destroy_vm only calls free_image on main volumes — it never calls
+# volume_snapshot_delete for file-based snapshot layouts. Without this,
+# {vmid}/snaps/{snap}/{name} survives destroy and blocks the next VMID
+# consumer with "File exists" on snapshot_create.
+#
+# All path components are regex-untainted because pvedaemon runs with
+# Perl's -T flag; readdir output and parse_volname results are tainted.
+sub _cleanup_vmid_residuals {
+    my ($scfg, $vmid, $parsed_name) = @_;
+
+    ($vmid) = ($vmid =~ /^(\d+)$/) or return;
+    ($parsed_name) = ($parsed_name =~ /^([-\w.]+)$/) or return;
+    my ($safe_path) = ($scfg->{path} =~ m|^(/.+)$|) or return;
+
+    my $snaps_root = "$safe_path/images/$vmid/snaps";
+    if (-d $snaps_root) {
+        if (opendir(my $sh, $snaps_root)) {
+            my @snap_names = grep { $_ ne '.' && $_ ne '..' } readdir($sh);
+            closedir($sh);
+            for my $snap_name (@snap_names) {
+                my ($safe_snap) = ($snap_name =~ /^([-\w.]+)$/) or next;
+                my $snap_dir  = "$snaps_root/$safe_snap";
+                my $snap_file = "$snap_dir/$parsed_name";
+                if (-e $snap_file) {
+                    log_debug "[free_image] Cleaning up orphaned snapshot $snap_file";
+                    unlink($snap_file)
+                        or log_debug "[free_image] Failed to unlink $snap_file: $!";
+                }
+                rmdir($snap_dir);
+            }
+        }
+        rmdir($snaps_root);
+    }
+
+    my $image_dir = "$safe_path/images/$vmid";
+    if (-d $image_dir) {
+        if (opendir(my $dh, $image_dir)) {
+            my @c = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+            closedir($dh);
+            if (@c == 0) {
+                rmdir($image_dir);
+            }
+        }
+    }
+}
+
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format_param) = @_;
 
@@ -546,7 +594,9 @@ sub free_image {
     if (!$scfg->{mfsbdev} || $vtype ne 'images') {
         my $reason = !$scfg->{mfsbdev} ? "mfsbdev_disabled" : "vtype_not_images ('$vtype')";
         log_debug "[free_image] Vol: $volname. Reason: $reason. Using SUPER::free_image.";
-        return $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        my $res = $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        _cleanup_vmid_residuals($scfg, $vmid, $parsed_name) if $vtype eq 'images';
+        return $res;
     }
 
     # --- mfsbdev is ON and vtype IS 'images' ---
@@ -594,10 +644,15 @@ sub free_image {
         # deletion. The helper above already dies on list failures, so we know
         # "not in $mappings" is an authoritative answer, not a silent error.
         log_debug "[free_image] Vol: $volname is not NBD-mapped. Using SUPER::free_image.";
-        return $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        my $res = $class->SUPER::free_image($storeid, $scfg, $volname, $isBase, $format_param);
+        _cleanup_vmid_residuals($scfg, $vmid, $parsed_name);
+        return $res;
     }
 
+    _cleanup_vmid_residuals($scfg, $vmid, $parsed_name);
+
     # Remove empty VM image directory to prevent future allocation issues
+    # (kept for backwards compat — _cleanup_vmid_residuals also does this)
     my $image_dir_path = "$scfg->{path}/images/$vmid";
     if (-d $image_dir_path) {
         opendir(my $dh, $image_dir_path) or log_debug "[free_image] Cannot open directory $image_dir_path: $!";
@@ -644,6 +699,20 @@ sub map_volume {
     # Only handle raw format image volumes
     return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname)
         if $vtype ne 'images' || $format ne 'raw';
+
+    # Skip NBD for small disks (cloudinit, EFI). Same threshold as
+    # alloc_image and path(). These tiny files cycle through NBD devices
+    # rapidly on test/migration workloads, and the kernel doesn't always
+    # release the device cleanly after unmap — leading to stale state
+    # that corrupts the next consumer of that /dev/nbdN.
+    my $full_file = "$scfg->{path}/images/$vmid/$name";
+    if (-e $full_file) {
+        my $sz = (stat($full_file))[7] // 0;
+        if ($sz > 0 && $sz <= 8 * 1024 * 1024) {
+            log_debug "[activate] $volname is small ($sz bytes), skipping NBD";
+            return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname);
+        }
+    }
 
     # Construct the MooseFS path from the parsed components
     my $mfs_path = "/images/$vmid/$name";
@@ -812,6 +881,15 @@ sub deactivate_volume {
         ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-f', $path]
         : ['/usr/sbin/mfsbdev', 'unmap', '-f', $path];
 
+    # Capture the NBD device path before unmapping so we can verify
+    # kernel state afterward.
+    my $nbd_device;
+    my $pre_mappings = eval { moosefs_bdev_list_mappings($scfg) };
+    if (!$@ && exists $pre_mappings->{$path}) {
+        # moosefs_bdev_list_mappings returns {mfs_path => /dev/nbdN}
+        $nbd_device = $pre_mappings->{$path};
+    }
+
     eval { run_command($cmd, errmsg => "can't unmap MooseFS device '$path'"); };
     if ($@) {
         my $err = $@;
@@ -826,10 +904,50 @@ sub deactivate_volume {
         my $recheck = eval { moosefs_bdev_list_mappings($scfg) };
         if (!$@ && !exists $recheck->{$path}) {
             log_debug "Unmap error for $volname was transient: mapping no longer present";
-            return 1;
+            # Fall through to device health check below
+        } else {
+            die "Failed to deactivate $volname: $err";
         }
+    }
 
-        die "Failed to deactivate $volname: $err";
+    # After successful unmap: verify the kernel NBD device is truly released.
+    # mfsbdev reports the mapping as gone, but the kernel can retain stale
+    # state (buffered I/O errors, cached pages, partially-initialized device).
+    # If the same /dev/nbdN gets reused for the next VM, operations fail with
+    # I/O errors, EBADMSG, or mkfs failures.
+    if (defined $nbd_device && $nbd_device =~ m|^(/dev/nbd\d+)$|) {
+        my $dev = $1;  # untaint
+        my $dev_name = $dev;
+        $dev_name =~ s|^/dev/||;
+
+        # Check if the kernel still thinks the device has a nonzero size
+        # (should be 0 after clean disconnect).
+        my $sysfs_size = "/sys/block/$dev_name/size";
+        if (-r $sysfs_size) {
+            my $sz = do { local $/; open my $fh, '<', $sysfs_size; <$fh> // '' };
+            chomp $sz;
+            if ($sz && $sz ne '0') {
+                log_debug "[deactivate] $dev still shows size=$sz after unmap, resetting device";
+                # Escalating cleanup: flush buffers → re-read partition table
+                # → force-unmap by device name → brief wait for kernel to settle.
+                eval { run_command(['blockdev', '--flushbufs', $dev], timeout => 5) };
+                eval { run_command(['blockdev', '--rereadpt', $dev], timeout => 5) };
+                select(undef, undef, undef, 0.5);  # 500ms settle
+                # Re-read size
+                $sz = do { local $/; open my $fh, '<', $sysfs_size; <$fh> // '' };
+                chomp $sz;
+                if ($sz && $sz ne '0') {
+                    log_debug "[deactivate] $dev still stale (size=$sz) after reset, force-unmapping";
+                    my $force_cmd = $scfg->{mfsnbdlink}
+                        ? ['/usr/sbin/mfsbdev', 'unmap', '-l', $scfg->{mfsnbdlink}, '-d', $dev]
+                        : ['/usr/sbin/mfsbdev', 'unmap', '-d', $dev];
+                    eval { run_command($force_cmd, timeout => 10) };
+                    # Final settle — let kernel fully release the device
+                    select(undef, undef, undef, 0.5);
+                    log_debug "[deactivate] force-unmap result: " . ($@ ? "error: $@" : "ok");
+                }
+            }
+        }
     }
 
     return 1;
@@ -1078,6 +1196,17 @@ sub volume_snapshot {
     my $mountpoint = $scfg->{path};
     my $snapdir = "$mountpoint/images/$vmid/snaps/$snap";
     File::Path::make_path($snapdir);
+
+    # Flush dirty pages/journal to the backing MooseFS file before
+    # snapshotting. For LXC containers with a raw-image rootfs, the ext4
+    # filesystem inside the raw file may have uncommitted journal entries.
+    # mfsmakesnapshot operates at the MooseFS-file level (below ext4), so
+    # the snapshot would capture a dirty-journal state. Mounting that
+    # snapshot read-only for vzdump then fails with EBADMSG on inodes
+    # whose metadata wasn't committed.
+    # sync flushes all dirty buffers including those for loop/NBD-mounted
+    # filesystems, ensuring the raw file on MooseFS is consistent.
+    run_command(['sync'], timeout => 30);
 
     run_command(['/usr/bin/mfsmakesnapshot', "$mountpoint/images/$vmid/$name", "$snapdir/$name"],
         errmsg => 'An error occurred while making the snapshot');
