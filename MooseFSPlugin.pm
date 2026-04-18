@@ -781,11 +781,19 @@ sub map_volume {
     my $map_backoff = 0.1; # Start with 100ms
     my $map_output = '';
     my $map_success = 0;
+    # On "MFS file is locked" we retry once with -i (ignore_locks). This
+    # recovers from a previous mfsbdev crash/SIGKILL where the unmap message
+    # never reached the master, leaving an orphan lock on the file. We only
+    # enable it after observing the lock error — never speculatively — so a
+    # genuine concurrent mapping still fails loudly.
+    my $use_ignore_locks = 0;
 
     for (my $attempt = 0; $attempt < $map_retries; $attempt++) {
-        my $map_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $path, '-s', $size_bytes]
-            : ['/usr/sbin/mfsbdev', 'map', '-f', $path, '-s', $size_bytes];
+        my @base_cmd = $scfg->{mfsnbdlink}
+            ? ('/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $path, '-s', $size_bytes)
+            : ('/usr/sbin/mfsbdev', 'map', '-f', $path, '-s', $size_bytes);
+        push @base_cmd, '-i' if $use_ignore_locks;
+        my $map_cmd = [ @base_cmd ];
 
         $map_output = '';
         eval {
@@ -809,6 +817,18 @@ sub map_volume {
                 select(undef, undef, undef, $map_backoff);
                 $map_backoff *= 1.5; # Exponential backoff
                 next; # Try again
+            }
+
+            # Stale MFS lock left by a prior mfsbdev that didn't exit cleanly.
+            # Retry once with -i so the user's workload isn't stuck waiting
+            # for the master to time out the orphan lock. We only flip the
+            # flag on the first occurrence to keep the diagnostic loud.
+            if ($error =~ /is locked/i && !$use_ignore_locks && $attempt < $map_retries - 1) {
+                warn "[moosefs] Stale MFS lock on $path — retrying map with -i (ignore_locks). "
+                    . "This usually means a previous mfsbdev was killed without sending unmap "
+                    . "(e.g. pvedaemon/pveproxy restart without the KillMode=mixed drop-in).\n";
+                $use_ignore_locks = 1;
+                next;
             }
 
             if ($error =~ /can't find free NBD device/) {
