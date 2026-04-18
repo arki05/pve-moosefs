@@ -208,9 +208,59 @@ sub moosefs_start_bdev {
 
     push @$cmd, '-o', 'mfsioretries=99999999';
 
-    eval { run_command($cmd, errmsg => 'mfsbdev start failed'); };
+    # Spawn mfsbdev inside a transient systemd scope so it ends up under
+    # system.slice instead of whichever PVE daemon's cgroup happened to
+    # first call activate_storage (pvedaemon / pveproxy / pvestatd).
+    #
+    # Without this, a `systemctl restart pvedaemon` SIGKILLs every
+    # process in pvedaemon's control group — mfsbdev included. Killed
+    # mid-flight, mfsbdev can't send unmap to the master, so its session
+    # leaks all its open NBD handles as "sustained" files on the master
+    # side and the chunks they reference never get reclaimed. A cluster
+    # that runs a few VM create/destroy cycles this way fills up to 100%
+    # even though nothing shows up under /mnt/<store>/images anymore.
+    #
+    # `KillMode=mixed` drop-ins for those services only help AFTER the
+    # drop-in is in effect, which requires a restart — catch-22 on first
+    # upgrade. Putting mfsbdev in its own scope removes the parent-cgroup
+    # entanglement entirely.
+    #
+    # --collect: transient scope is reaped when last process in it exits
+    # --slice:   pin it under system.slice even if the caller is in
+    #            user.slice or one of the PVE service slices
+    # Unit name is deterministic per-daemon (mfsnbdlink basename) so a
+    # subsequent spawn finds the existing scope rather than making a new
+    # one; if the scope is active, systemd-run exits non-zero and we
+    # treat that as "daemon already running" (same handling as the
+    # "Address already in use" socket case below).
+    my $scope_name = 'pve-moosefs-bdev';
+    if (defined $scfg->{mfsnbdlink}) {
+        my $leaf = $scfg->{mfsnbdlink};
+        $leaf =~ s|.*/||;
+        $leaf =~ s|[^-\w.]|_|g;
+        $scope_name .= "-$leaf" if length $leaf;
+    }
+    my @scoped_cmd = (
+        'systemd-run',
+        '--scope',
+        '--collect',
+        '--slice=system.slice',
+        "--unit=$scope_name.scope",
+        '--description=MooseFS NBD bridge (mfsbdev)',
+        '--',
+        @$cmd,
+    );
+
+    eval { run_command(\@scoped_cmd, errmsg => 'mfsbdev start failed'); };
     if ($@) {
         my $error = $@;
+
+        # Scope name already in use ⇒ a mfsbdev for this daemon is already
+        # running under the scope. Same outcome as "socket already in use".
+        if ($error =~ /unit .* already exists|is already (active|in use)/i) {
+            log_debug "[moosefs_start_bdev] scope $scope_name already active, mfsbdev already running";
+            return;
+        }
 
         # If socket already exists, mfsbdev is already running - this is fine
         if ($error =~ /Address already in use/) {
