@@ -734,8 +734,7 @@ sub map_volume {
 
     unless (defined $volname) {
         log_debug "[map_volume] volname is undefined, skipping";
-        # Or, perhaps fall back to a SUPER call if appropriate for this method
-        return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname);
+        return undef;
     }
 
     my ($vtype, $name, $vmid, undef, undef, $isBase, $format) = $class->parse_volname($volname);
@@ -746,21 +745,28 @@ sub map_volume {
         return $scfg->{path} . "/images/$vmid/$name";
     }
 
-    # Only handle raw format image volumes
-    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname)
+    # Only handle raw format image volumes — defer to the plugin's own
+    # path() for anything else. Previously this returned SUPER::activate_volume,
+    # whose scalar value is undef/empty and gets handed to callers (notably
+    # start_swtpm → `swtpm_setup --tpmstate file://<empty>`) as if it were a
+    # path. Return the filesystem path so the caller always gets a usable
+    # string back.
+    return $class->filesystem_path($scfg, $volname, $snapname)
         if $vtype ne 'images' || $format ne 'raw';
 
-    # Skip NBD for small disks (cloudinit, EFI). Same threshold as
-    # alloc_image and path(). These tiny files cycle through NBD devices
-    # rapidly on test/migration workloads, and the kernel doesn't always
-    # release the device cleanly after unmap — leading to stale state
-    # that corrupts the next consumer of that /dev/nbdN.
+    # Skip NBD for small disks (cloudinit, EFI, legacy-named TPM state).
+    # Same threshold as alloc_image and path(). These tiny files cycle
+    # through NBD devices rapidly on test/migration workloads, and the
+    # kernel doesn't always release the device cleanly after unmap —
+    # leading to stale state that corrupts the next consumer of that
+    # /dev/nbdN. Return the filesystem path, not SUPER::activate_volume's
+    # return value (see reasoning above).
     my $full_file = "$scfg->{path}/images/$vmid/$name";
     if (-e $full_file) {
         my $sz = (stat($full_file))[7] // 0;
         if ($sz > 0 && $sz <= 8 * 1024 * 1024) {
             log_debug "[activate] $volname is small ($sz bytes), skipping NBD";
-            return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname);
+            return $class->filesystem_path($scfg, $volname, $snapname);
         }
     }
 
