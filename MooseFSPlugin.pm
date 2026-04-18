@@ -84,6 +84,56 @@ sub moosefs_bdev_list_mappings {
     return \%mappings;
 }
 
+# Compare the size the existing NBD mapping was established with against the
+# current MooseFS file size and, if they differ, issue `mfsbdev resize` so
+# callers reusing the mapping don't see stale geometry. The drift happens
+# when a file is resized out of band via the FUSE path (losetup + truncate,
+# qemu-img resize on the filesystem path, etc.) while the NBD export keeps
+# the size it was mapped with.
+#
+# Returns 1 on success or when sizes already match; 0 on resize failure.
+# Intentionally tolerant: any list/parse failure yields 1 so we don't block
+# the caller's reuse path on a diagnostic extra.
+sub moosefs_bdev_sync_size {
+    my ($scfg, $mfs_path, $nbd_device, $expected_bytes) = @_;
+
+    return 1 unless moosefs_bdev_is_active($scfg);
+    return 1 unless defined $expected_bytes && $expected_bytes > 0;
+
+    my $list_cmd = $scfg->{mfsnbdlink}
+        ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+        : ['/usr/sbin/mfsbdev', 'list'];
+
+    my $output = '';
+    eval { run_command($list_cmd, outfunc => sub { $output .= shift; }); };
+    return 1 if $@;
+
+    my $mapped_size;
+    my $q_path = quotemeta $mfs_path;
+    for my $line (split /\r?\n/, $output) {
+        if ($line =~ /\bfile:\s*$q_path\s.*?\bsize:\s*(\d+)/) {
+            $mapped_size = $1 + 0;
+            last;
+        }
+    }
+    return 1 unless defined $mapped_size;
+    return 1 if $mapped_size == $expected_bytes;
+
+    warn "[moosefs] NBD size drift on $nbd_device for $mfs_path: "
+        . "mapping cached $mapped_size bytes, file is $expected_bytes bytes. Resizing.\n";
+
+    my $resize_cmd = $scfg->{mfsnbdlink}
+        ? ['/usr/sbin/mfsbdev', 'resize', '-l', $scfg->{mfsnbdlink}, '-d', $nbd_device, '-s', $expected_bytes]
+        : ['/usr/sbin/mfsbdev', 'resize', '-d', $nbd_device, '-s', $expected_bytes];
+
+    eval { run_command($resize_cmd, errmsg => 'mfsbdev resize failed'); };
+    if ($@) {
+        log_debug "[moosefs_bdev_sync_size] resize failed for $nbd_device: $@";
+        return 0;
+    }
+    return 1;
+}
+
 # Returns true only if the socket (mfsnbdlink or default) exists _and_ we can open() it as a UNIX stream.
 sub moosefs_bdev_is_active {
     my ($scfg) = @_;
@@ -737,6 +787,15 @@ sub map_volume {
             log_debug "Failed to list MooseFS block devices (attempt $attempt): $@";
         } elsif (my $existing = $mappings->{$mfs_path}) {
             log_debug "Found existing NBD device $existing for volume $volname (attempt $attempt)";
+            # Heal stale NBD geometry: if the backing file was resized out of
+            # band (e.g. losetup+truncate / qemu-img on the FUSE path) while
+            # this mapping persisted, the export still advertises the old
+            # size — subsequent clone/migrate reads off the stale length and
+            # either over-copies or truncates the destination. Sync it now
+            # before returning the device.
+            my $current_size = -s $full_file;
+            moosefs_bdev_sync_size($scfg, $mfs_path, $existing, $current_size)
+                if defined $current_size;
             return $existing;
         }
 
