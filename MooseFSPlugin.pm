@@ -240,6 +240,21 @@ sub moosefs_start_bdev {
         $leaf =~ s|[^-\w.]|_|g;
         $scope_name .= "-$leaf" if length $leaf;
     }
+    # systemd-run --scope moves the child into its own cgroup but the
+    # spawned process still inherits the invoking daemon's file
+    # descriptors. For mfsbdev that matters because pvestatd/pvedaemon
+    # hold exclusive locks on /run/<service>.pid.lock — if mfsbdev
+    # inherits that fd and then outlives a daemon restart, the daemon
+    # can no longer re-acquire its own lock and fails to start with
+    # "Resource temporarily unavailable".
+    #
+    # Wrap the command in `sh -c` that closes every fd from 3 up
+    # before exec'ing mfsbdev, so the long-lived daemon only keeps
+    # stdin/stdout/stderr (which systemd-run redirects to the journal
+    # anyway).
+    my $fd_close = 'for fd in $(ls /proc/$$/fd 2>/dev/null); '
+        . 'do if [ "$fd" -ge 3 ] 2>/dev/null; then eval "exec $fd>&-" 2>/dev/null; fi; done; '
+        . 'exec "$@"';
     my @scoped_cmd = (
         'systemd-run',
         '--scope',
@@ -248,6 +263,7 @@ sub moosefs_start_bdev {
         "--unit=$scope_name.scope",
         '--description=MooseFS NBD bridge (mfsbdev)',
         '--',
+        '/bin/sh', '-c', $fd_close, 'mfsbdev-launcher',
         @$cmd,
     );
 
