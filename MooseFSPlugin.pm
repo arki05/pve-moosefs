@@ -84,6 +84,56 @@ sub moosefs_bdev_list_mappings {
     return \%mappings;
 }
 
+# Compare the size the existing NBD mapping was established with against the
+# current MooseFS file size and, if they differ, issue `mfsbdev resize` so
+# callers reusing the mapping don't see stale geometry. The drift happens
+# when a file is resized out of band via the FUSE path (losetup + truncate,
+# qemu-img resize on the filesystem path, etc.) while the NBD export keeps
+# the size it was mapped with.
+#
+# Returns 1 on success or when sizes already match; 0 on resize failure.
+# Intentionally tolerant: any list/parse failure yields 1 so we don't block
+# the caller's reuse path on a diagnostic extra.
+sub moosefs_bdev_sync_size {
+    my ($scfg, $mfs_path, $nbd_device, $expected_bytes) = @_;
+
+    return 1 unless moosefs_bdev_is_active($scfg);
+    return 1 unless defined $expected_bytes && $expected_bytes > 0;
+
+    my $list_cmd = $scfg->{mfsnbdlink}
+        ? ['/usr/sbin/mfsbdev', 'list', '-l', $scfg->{mfsnbdlink}]
+        : ['/usr/sbin/mfsbdev', 'list'];
+
+    my $output = '';
+    eval { run_command($list_cmd, outfunc => sub { $output .= shift; }); };
+    return 1 if $@;
+
+    my $mapped_size;
+    my $q_path = quotemeta $mfs_path;
+    for my $line (split /\r?\n/, $output) {
+        if ($line =~ /\bfile:\s*$q_path\s.*?\bsize:\s*(\d+)/) {
+            $mapped_size = $1 + 0;
+            last;
+        }
+    }
+    return 1 unless defined $mapped_size;
+    return 1 if $mapped_size == $expected_bytes;
+
+    warn "[moosefs] NBD size drift on $nbd_device for $mfs_path: "
+        . "mapping cached $mapped_size bytes, file is $expected_bytes bytes. Resizing.\n";
+
+    my $resize_cmd = $scfg->{mfsnbdlink}
+        ? ['/usr/sbin/mfsbdev', 'resize', '-l', $scfg->{mfsnbdlink}, '-d', $nbd_device, '-s', $expected_bytes]
+        : ['/usr/sbin/mfsbdev', 'resize', '-d', $nbd_device, '-s', $expected_bytes];
+
+    eval { run_command($resize_cmd, errmsg => 'mfsbdev resize failed'); };
+    if ($@) {
+        log_debug "[moosefs_bdev_sync_size] resize failed for $nbd_device: $@";
+        return 0;
+    }
+    return 1;
+}
+
 # Returns true only if the socket (mfsnbdlink or default) exists _and_ we can open() it as a UNIX stream.
 sub moosefs_bdev_is_active {
     my ($scfg) = @_;
@@ -158,9 +208,75 @@ sub moosefs_start_bdev {
 
     push @$cmd, '-o', 'mfsioretries=99999999';
 
-    eval { run_command($cmd, errmsg => 'mfsbdev start failed'); };
+    # Spawn mfsbdev inside a transient systemd scope so it ends up under
+    # system.slice instead of whichever PVE daemon's cgroup happened to
+    # first call activate_storage (pvedaemon / pveproxy / pvestatd).
+    #
+    # Without this, a `systemctl restart pvedaemon` SIGKILLs every
+    # process in pvedaemon's control group — mfsbdev included. Killed
+    # mid-flight, mfsbdev can't send unmap to the master, so its session
+    # leaks all its open NBD handles as "sustained" files on the master
+    # side and the chunks they reference never get reclaimed. A cluster
+    # that runs a few VM create/destroy cycles this way fills up to 100%
+    # even though nothing shows up under /mnt/<store>/images anymore.
+    #
+    # `KillMode=mixed` drop-ins for those services only help AFTER the
+    # drop-in is in effect, which requires a restart — catch-22 on first
+    # upgrade. Putting mfsbdev in its own scope removes the parent-cgroup
+    # entanglement entirely.
+    #
+    # --collect: transient scope is reaped when last process in it exits
+    # --slice:   pin it under system.slice even if the caller is in
+    #            user.slice or one of the PVE service slices
+    # Unit name is deterministic per-daemon (mfsnbdlink basename) so a
+    # subsequent spawn finds the existing scope rather than making a new
+    # one; if the scope is active, systemd-run exits non-zero and we
+    # treat that as "daemon already running" (same handling as the
+    # "Address already in use" socket case below).
+    my $scope_name = 'pve-moosefs-bdev';
+    if (defined $scfg->{mfsnbdlink}) {
+        my $leaf = $scfg->{mfsnbdlink};
+        $leaf =~ s|.*/||;
+        $leaf =~ s|[^-\w.]|_|g;
+        $scope_name .= "-$leaf" if length $leaf;
+    }
+    # systemd-run --scope moves the child into its own cgroup but the
+    # spawned process still inherits the invoking daemon's file
+    # descriptors. For mfsbdev that matters because pvestatd/pvedaemon
+    # hold exclusive locks on /run/<service>.pid.lock — if mfsbdev
+    # inherits that fd and then outlives a daemon restart, the daemon
+    # can no longer re-acquire its own lock and fails to start with
+    # "Resource temporarily unavailable".
+    #
+    # Wrap the command in `sh -c` that closes every fd from 3 up
+    # before exec'ing mfsbdev, so the long-lived daemon only keeps
+    # stdin/stdout/stderr (which systemd-run redirects to the journal
+    # anyway).
+    my $fd_close = 'for fd in $(ls /proc/$$/fd 2>/dev/null); '
+        . 'do if [ "$fd" -ge 3 ] 2>/dev/null; then eval "exec $fd>&-" 2>/dev/null; fi; done; '
+        . 'exec "$@"';
+    my @scoped_cmd = (
+        'systemd-run',
+        '--scope',
+        '--collect',
+        '--slice=system.slice',
+        "--unit=$scope_name.scope",
+        '--description=MooseFS NBD bridge (mfsbdev)',
+        '--',
+        '/bin/sh', '-c', $fd_close, 'mfsbdev-launcher',
+        @$cmd,
+    );
+
+    eval { run_command(\@scoped_cmd, errmsg => 'mfsbdev start failed'); };
     if ($@) {
         my $error = $@;
+
+        # Scope name already in use ⇒ a mfsbdev for this daemon is already
+        # running under the scope. Same outcome as "socket already in use".
+        if ($error =~ /unit .* already exists|is already (active|in use)/i) {
+            log_debug "[moosefs_start_bdev] scope $scope_name already active, mfsbdev already running";
+            return;
+        }
 
         # If socket already exists, mfsbdev is already running - this is fine
         if ($error =~ /Address already in use/) {
@@ -684,8 +800,7 @@ sub map_volume {
 
     unless (defined $volname) {
         log_debug "[map_volume] volname is undefined, skipping";
-        # Or, perhaps fall back to a SUPER call if appropriate for this method
-        return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname);
+        return undef;
     }
 
     my ($vtype, $name, $vmid, undef, undef, $isBase, $format) = $class->parse_volname($volname);
@@ -696,21 +811,28 @@ sub map_volume {
         return $scfg->{path} . "/images/$vmid/$name";
     }
 
-    # Only handle raw format image volumes
-    return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname)
+    # Only handle raw format image volumes — defer to the plugin's own
+    # path() for anything else. Previously this returned SUPER::activate_volume,
+    # whose scalar value is undef/empty and gets handed to callers (notably
+    # start_swtpm → `swtpm_setup --tpmstate file://<empty>`) as if it were a
+    # path. Return the filesystem path so the caller always gets a usable
+    # string back.
+    return $class->filesystem_path($scfg, $volname, $snapname)
         if $vtype ne 'images' || $format ne 'raw';
 
-    # Skip NBD for small disks (cloudinit, EFI). Same threshold as
-    # alloc_image and path(). These tiny files cycle through NBD devices
-    # rapidly on test/migration workloads, and the kernel doesn't always
-    # release the device cleanly after unmap — leading to stale state
-    # that corrupts the next consumer of that /dev/nbdN.
+    # Skip NBD for small disks (cloudinit, EFI, legacy-named TPM state).
+    # Same threshold as alloc_image and path(). These tiny files cycle
+    # through NBD devices rapidly on test/migration workloads, and the
+    # kernel doesn't always release the device cleanly after unmap —
+    # leading to stale state that corrupts the next consumer of that
+    # /dev/nbdN. Return the filesystem path, not SUPER::activate_volume's
+    # return value (see reasoning above).
     my $full_file = "$scfg->{path}/images/$vmid/$name";
     if (-e $full_file) {
         my $sz = (stat($full_file))[7] // 0;
         if ($sz > 0 && $sz <= 8 * 1024 * 1024) {
             log_debug "[activate] $volname is small ($sz bytes), skipping NBD";
-            return $class->SUPER::activate_volume($storeid, $scfg, $volname, $snapname);
+            return $class->filesystem_path($scfg, $volname, $snapname);
         }
     }
 
@@ -737,6 +859,15 @@ sub map_volume {
             log_debug "Failed to list MooseFS block devices (attempt $attempt): $@";
         } elsif (my $existing = $mappings->{$mfs_path}) {
             log_debug "Found existing NBD device $existing for volume $volname (attempt $attempt)";
+            # Heal stale NBD geometry: if the backing file was resized out of
+            # band (e.g. losetup+truncate / qemu-img on the FUSE path) while
+            # this mapping persisted, the export still advertises the old
+            # size — subsequent clone/migrate reads off the stale length and
+            # either over-copies or truncates the destination. Sync it now
+            # before returning the device.
+            my $current_size = -s $full_file;
+            moosefs_bdev_sync_size($scfg, $mfs_path, $existing, $current_size)
+                if defined $current_size;
             return $existing;
         }
 
@@ -781,11 +912,19 @@ sub map_volume {
     my $map_backoff = 0.1; # Start with 100ms
     my $map_output = '';
     my $map_success = 0;
+    # On "MFS file is locked" we retry once with -i (ignore_locks). This
+    # recovers from a previous mfsbdev crash/SIGKILL where the unmap message
+    # never reached the master, leaving an orphan lock on the file. We only
+    # enable it after observing the lock error — never speculatively — so a
+    # genuine concurrent mapping still fails loudly.
+    my $use_ignore_locks = 0;
 
     for (my $attempt = 0; $attempt < $map_retries; $attempt++) {
-        my $map_cmd = $scfg->{mfsnbdlink}
-            ? ['/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $path, '-s', $size_bytes]
-            : ['/usr/sbin/mfsbdev', 'map', '-f', $path, '-s', $size_bytes];
+        my @base_cmd = $scfg->{mfsnbdlink}
+            ? ('/usr/sbin/mfsbdev', 'map', '-l', $scfg->{mfsnbdlink}, '-f', $path, '-s', $size_bytes)
+            : ('/usr/sbin/mfsbdev', 'map', '-f', $path, '-s', $size_bytes);
+        push @base_cmd, '-i' if $use_ignore_locks;
+        my $map_cmd = [ @base_cmd ];
 
         $map_output = '';
         eval {
@@ -809,6 +948,18 @@ sub map_volume {
                 select(undef, undef, undef, $map_backoff);
                 $map_backoff *= 1.5; # Exponential backoff
                 next; # Try again
+            }
+
+            # Stale MFS lock left by a prior mfsbdev that didn't exit cleanly.
+            # Retry once with -i so the user's workload isn't stuck waiting
+            # for the master to time out the orphan lock. We only flip the
+            # flag on the first occurrence to keep the diagnostic loud.
+            if ($error =~ /is locked/i && !$use_ignore_locks && $attempt < $map_retries - 1) {
+                warn "[moosefs] Stale MFS lock on $path — retrying map with -i (ignore_locks). "
+                    . "This usually means a previous mfsbdev was killed without sending unmap "
+                    . "(e.g. pvedaemon/pveproxy restart without the KillMode=mixed drop-in).\n";
+                $use_ignore_locks = 1;
+                next;
             }
 
             if ($error =~ /can't find free NBD device/) {
