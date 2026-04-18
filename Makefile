@@ -30,9 +30,18 @@ install:
 	# Install the patch file
 	install -d ${DESTDIR}${DATADIR}
 	install -m 0644 pve-moosefs.patch ${DESTDIR}${DATADIR}/
-	# Install pvestatd systemd drop-in (see issue #60)
+	# Install systemd drop-ins for PVE daemons that can spawn mfsbdev/mfsmount.
+	# The drop-in switches KillMode to "mixed" so `systemctl restart` doesn't
+	# SIGKILL spawned children (mfsbdev, mfsmount) — which would leak MFS locks
+	# and break FUSE mounts. pvestatd covers the activation-cycle path (see
+	# issue #60); pvedaemon and pveproxy cover the API / UI paths that also
+	# trigger activate_storage and may parent mfsbdev/mfsmount.
 	install -d ${DESTDIR}/etc/systemd/system/pvestatd.service.d
 	install -m 0644 systemd/pvestatd-moosefs.conf ${DESTDIR}/etc/systemd/system/pvestatd.service.d/moosefs.conf
+	install -d ${DESTDIR}/etc/systemd/system/pvedaemon.service.d
+	install -m 0644 systemd/pvedaemon-moosefs.conf ${DESTDIR}/etc/systemd/system/pvedaemon.service.d/moosefs.conf
+	install -d ${DESTDIR}/etc/systemd/system/pveproxy.service.d
+	install -m 0644 systemd/pveproxy-moosefs.conf ${DESTDIR}/etc/systemd/system/pveproxy.service.d/moosefs.conf
 
 .PHONY: deb ${DEB}
 deb ${DEB}:
